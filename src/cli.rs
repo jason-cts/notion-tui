@@ -15,6 +15,7 @@ Usage: notion-tui [--demo | --login | --logout]
 
 A nonempty NOTION_API_TOKEN takes precedence over saved OAuth login.
 Without a token, use saved OAuth credentials or log in through your browser.
+Missing credentials open an interactive API token / OAuth setup screen.
 
 OAuth setup:
   NOTION_OAUTH_CLIENT_ID       Your Notion OAuth integration client ID
@@ -50,16 +51,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Mode> {
     Ok(mode)
 }
 
-pub fn uses_oauth(mode: Mode, token: Option<&str>) -> bool {
-    mode == Mode::Login
-        || (mode == Mode::Normal && token.is_none_or(|token| token.trim().is_empty()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn modes_and_authentication_precedence() {
+    fn command_line_modes() {
         assert_eq!(parse(vec![]).unwrap(), Mode::Normal);
         for (flag, mode) in [
             ("--demo", Mode::Demo),
@@ -71,10 +67,5 @@ mod tests {
         assert!(parse(vec!["--demo".into(), "--login".into()]).is_err());
         assert!(parse(vec!["--login".into(), "--logout".into()]).is_err());
         assert!(parse(vec!["--bad".into()]).is_err());
-        assert!(uses_oauth(Mode::Normal, None));
-        assert!(uses_oauth(Mode::Normal, Some("  ")));
-        assert!(!uses_oauth(Mode::Normal, Some("token")));
-        assert!(uses_oauth(Mode::Login, Some("token")));
-        assert!(!uses_oauth(Mode::Demo, None));
     }
 }

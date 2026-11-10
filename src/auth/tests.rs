@@ -541,7 +541,10 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = crate::app::App::new(api.clone(), tx, false);
-    let mut editor = crate::editor::Editor::new(crate::editor::Target::Append("page".into()));
+    let mut editor = crate::editor::Editor::new(crate::editor::Target::Append {
+        parent: "page".into(),
+        after: Some("anchor".into()),
+    });
     editor.buffer.insert("unsaved draft");
     app.editor = Some(editor);
     app.key(crossterm::event::KeyEvent::new(
@@ -556,6 +559,8 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
     );
     assert!(!app.saving);
     assert_eq!(app.editor.as_ref().unwrap().buffer.text, "unsaved draft");
+    assert!(matches!(&app.editor.as_ref().unwrap().target,
+        crate::editor::Target::Append { after: Some(after), .. } if after == "anchor"));
     assert!(
         app.editor
             .as_ref()
@@ -584,6 +589,7 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
         .await;
     api.write(Write::Append {
         parent: "page".into(),
+        after: Some("anchor".into()),
         kind: Kind::Paragraph,
         text: "unsaved draft".into(),
     })

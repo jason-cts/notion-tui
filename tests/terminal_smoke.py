@@ -53,6 +53,15 @@ try:
     wait_for("Nested content")
     send("\x7f")
     wait_for("Your workspace, at your fingertips")
+    send("n")
+    wait_for("NEW CHILD PAGE")
+    # Exercise both DEL and BS through crossterm, including a multibyte glyph.
+    send("🦀x\x7f\x08\x13")
+    wait_for("A page title is required")
+    send("\x1b")
+    wait_for("Discard this draft?")
+    send("y")
+    wait_for("CONTENT")
     send("a")
     wait_for("APPEND BLOCK")
     send("draft text\x13")
@@ -79,7 +88,7 @@ try:
         transcript.extend(os.read(master, 65536))
     assert b"\x1b[?1049l" in transcript, "Alternate screen was not restored"
     assert b"\x1b[?2004l" in transcript, "Bracketed paste was not disabled"
-    print("PASS: search, nested navigation, failed-save draft, narrow layout, full-block reader, terminal restoration")
+    print("PASS: search, nested navigation, both Backspace encodings, failed-save draft, narrow layout, full-block reader, terminal restoration")
 finally:
     if process.poll() is None:
         process.kill()

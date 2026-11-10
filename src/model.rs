@@ -1,3 +1,4 @@
+use crate::rich_text::{RichRun, external_url};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub struct BlockItem {
     pub modified: String,
     pub block_type: String,
     pub text: String,
+    pub rich_text: Vec<RichRun>,
     pub children: bool,
     pub checked: bool,
     pub kind: Option<Kind>,
@@ -60,6 +62,9 @@ impl BlockItem {
         let block_type = value["type"].as_str().unwrap_or("unsupported").to_owned();
         let body = &value[&block_type];
         let runs = body["rich_text"].as_array();
+        let mut rich_text: Vec<RichRun> = runs
+            .map(|runs| runs.iter().map(RichRun::from_value).collect())
+            .unwrap_or_default();
         let mut text = runs
             .map(|runs| {
                 runs.iter()
@@ -82,24 +87,29 @@ impl BlockItem {
                 .to_owned();
         }
         if block_type == "table_row" {
-            text = body["cells"]
-                .as_array()
-                .map(|cells| {
-                    cells
-                        .iter()
-                        .map(|cell| {
-                            cell.as_array()
-                                .map(|runs| {
-                                    runs.iter()
-                                        .map(|r| r["plain_text"].as_str().unwrap_or(""))
-                                        .collect::<String>()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" │ ")
-                })
-                .unwrap_or_default();
+            rich_text.clear();
+            if let Some(cells) = body["cells"].as_array() {
+                for (index, cell) in cells.iter().enumerate() {
+                    if index > 0 {
+                        rich_text.push(RichRun::plain(" │ "));
+                    }
+                    if let Some(runs) = cell.as_array() {
+                        rich_text.extend(runs.iter().map(RichRun::from_value));
+                    }
+                }
+            }
+            text = rich_text.iter().map(|run| run.text.as_str()).collect();
+        }
+        if rich_text.is_empty()
+            || rich_text
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+                != text
+        {
+            let mut run = RichRun::plain(text.clone());
+            run.url = body["url"].as_str().and_then(external_url);
+            rich_text = vec![run];
         }
         let styled = runs.is_some_and(|runs| {
             runs.iter().any(|r| {
@@ -129,6 +139,7 @@ impl BlockItem {
             child_page: block_type == "child_page",
             block_type,
             text,
+            rich_text,
             styled,
             protected,
         }
@@ -158,13 +169,37 @@ impl BlockItem {
         BlockLabel {
             prefix: format!("{}{marker}", "  ".repeat(depth)),
             text: format!("{text}{}", if self.children { "  ›" } else { "" }),
+            rich_text: {
+                let mut runs = if !self.text.is_empty()
+                    && self
+                        .rich_text
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>()
+                        == self.text
+                {
+                    self.rich_text.clone()
+                } else {
+                    vec![RichRun::plain(text)]
+                };
+                if self.children {
+                    runs.push(RichRun::plain("  ›"));
+                }
+                runs
+            },
         }
+    }
+
+    pub fn external_links(&self) -> Vec<(String, String)> {
+        crate::rich_text::external_links(&self.rich_text)
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct BlockLabel {
     pub prefix: String,
     pub text: String,
+    pub rich_text: Vec<RichRun>,
 }
 
 impl BlockLabel {
@@ -254,12 +289,18 @@ pub fn update_payload(block: &BlockItem, text: Option<&str>) -> Value {
     json!({block.block_type.clone(): fields})
 }
 
-pub fn append_payload(kind: Kind, text: &str) -> Value {
+pub fn append_payload(kind: Kind, text: &str, after: Option<&str>) -> Value {
     let mut fields = json!({"rich_text": rich_text(text)});
     if kind == Kind::Todo {
         fields["checked"] = json!(false);
     }
-    json!({"children": [{"object": "block", "type": kind.name(), kind.name(): fields}]})
+    let mut payload =
+        json!({"children": [{"object": "block", "type": kind.name(), kind.name(): fields}]});
+    if let Some(after) = after {
+        // Keep the insertion anchor explicit for the pinned 2022-06-28 API.
+        payload["after"] = json!(after);
+    }
+    payload
 }
 
 #[cfg(test)]
@@ -329,7 +370,7 @@ pub(crate) mod tests {
             json!({"to_do":{"checked":true}})
         );
         assert_eq!(
-            append_payload(Kind::Todo, "task")["children"][0]["to_do"]["checked"],
+            append_payload(Kind::Todo, "task", None)["children"][0]["to_do"]["checked"],
             false
         );
     }

@@ -23,6 +23,7 @@ pub struct Location {
 }
 
 pub enum Message {
+    Browser(Result<(), String>),
     Search {
         generation: u64,
         result: Result<Vec<PageItem>, String>,
@@ -41,6 +42,11 @@ pub enum Confirm {
     Quit,
 }
 
+pub struct LinkPicker {
+    pub links: Vec<(String, String)>,
+    pub selected: usize,
+}
+
 pub struct App {
     pub pages: Vec<PageItem>,
     pub blocks: Vec<BlockItem>,
@@ -54,7 +60,9 @@ pub struct App {
     pub confirm: Option<Confirm>,
     pub help: bool,
     pub help_scroll: u16,
-    pub viewer: Option<(String, u16)>,
+    pub viewer: Option<(BlockLabel, u16)>,
+    pub link_picker: Option<LinkPicker>,
+    pub pending_link: Option<String>,
     pub status: String,
     pub error: bool,
     pub loading_search: bool,
@@ -64,6 +72,7 @@ pub struct App {
     pub demo: bool,
     search_generation: u64,
     content_generation: u64,
+    selection_after_insert: Option<(String, String)>,
     service: Service,
     sender: mpsc::UnboundedSender<Message>,
 }
@@ -87,6 +96,8 @@ impl App {
             help: false,
             help_scroll: 0,
             viewer: None,
+            link_picker: None,
+            pending_link: None,
             status: "Search pages shared with your integration".into(),
             error: false,
             loading_search: false,
@@ -95,6 +106,7 @@ impl App {
             quit: false,
             search_generation: 0,
             content_generation: 0,
+            selection_after_insert: None,
         }
     }
 
@@ -177,6 +189,11 @@ impl App {
 
     pub fn receive(&mut self, message: Message) {
         match message {
+            Message::Browser(Ok(())) => {
+                self.status = "Opened link in your browser".into();
+                self.error = false;
+            }
+            Message::Browser(Err(error)) => self.fail(error),
             Message::Search { generation, result } if generation == self.search_generation => {
                 self.loading_search = false;
                 match result {
@@ -194,6 +211,14 @@ impl App {
                 self.loading_content = false;
                 match result {
                     Ok((location, blocks)) => {
+                        if let Some((parent, after)) = self.selection_after_insert.take()
+                            && parent == location.id
+                        {
+                            self.block_selected = blocks
+                                .iter()
+                                .position(|block| block.id == after)
+                                .map_or(0, |index| (index + 1).min(blocks.len().saturating_sub(1)));
+                        }
                         if let Some(last) = self.path.last_mut() {
                             *last = location;
                         }
@@ -211,6 +236,17 @@ impl App {
                 self.saving = false;
                 match result {
                     Ok(created) => {
+                        self.selection_after_insert = self.editor.as_ref().and_then(|editor| {
+                            if let Target::Append {
+                                parent,
+                                after: Some(after),
+                            } = &editor.target
+                            {
+                                Some((parent.clone(), after.clone()))
+                            } else {
+                                None
+                            }
+                        });
                         self.editor = None;
                         self.confirm = None;
                         self.error = false;
@@ -281,6 +317,28 @@ impl App {
             }
             return;
         }
+        if let Some(picker) = &mut self.link_picker {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.selected = (picker.selected + 1) % picker.links.len()
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected =
+                        (picker.selected + picker.links.len() - 1) % picker.links.len()
+                }
+                KeyCode::Enter => {
+                    self.pending_link = Some(picker.links[picker.selected].1.clone());
+                    self.link_picker = None;
+                }
+                KeyCode::Esc => self.link_picker = None,
+                _ => {}
+            }
+            return;
+        }
+        if self.viewer.is_some() && key.code == KeyCode::Char('o') {
+            self.open_links();
+            return;
+        }
         if self.help || self.viewer.is_some() {
             let scroll = if self.help {
                 &mut self.help_scroll
@@ -337,9 +395,10 @@ impl App {
             }
             KeyCode::Char('v') if self.focus == Focus::Content => {
                 if let Some(label) = self.block_labels().get(self.block_selected) {
-                    self.viewer = Some((label.plain(), 0));
+                    self.viewer = Some((label.clone(), 0));
                 }
             }
+            KeyCode::Char('o') if self.focus == Focus::Content => self.open_links(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Pages => Focus::Content,
@@ -395,7 +454,19 @@ impl App {
                     return;
                 }
                 if let Some(location) = self.location() {
-                    self.editor = Some(Editor::new(Target::Append(location.id.clone())));
+                    let after = self
+                        .blocks
+                        .get(self.block_selected)
+                        .map(|block| block.id.clone());
+                    if (!self.blocks.is_empty() && after.is_none()) || after.as_deref() == Some("")
+                    {
+                        self.fail("Select a block before inserting");
+                        return;
+                    }
+                    self.editor = Some(Editor::new(Target::Append {
+                        parent: location.id.clone(),
+                        after,
+                    }));
                 }
             }
             KeyCode::Char('n') if self.focus == Focus::Content => {
@@ -417,6 +488,22 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn open_links(&mut self) {
+        let links = if let Some((label, _)) = &self.viewer {
+            crate::rich_text::external_links(&label.rich_text)
+        } else {
+            self.blocks
+                .get(self.block_selected)
+                .map(|block| block.external_links())
+                .unwrap_or_default()
+        };
+        match links.len() {
+            0 => self.fail("No HTTP or HTTPS links in this block"),
+            1 => self.pending_link = Some(links[0].1.clone()),
+            _ => self.link_picker = Some(LinkPicker { links, selected: 0 }),
         }
     }
 

@@ -1,4 +1,5 @@
 mod callback;
+pub mod setup;
 mod store;
 
 use anyhow::{Context, Result, bail};
@@ -56,10 +57,6 @@ pub struct OAuthConfig {
 }
 
 impl OAuthConfig {
-    pub fn from_env() -> Result<Self> {
-        Self::from_lookup(env_value)
-    }
-
     fn from_lookup(lookup: impl Fn(&str) -> Result<Option<String>>) -> Result<Self> {
         let required = |name| {
             lookup(name)?.filter(|value| !value.trim().is_empty()).with_context(||

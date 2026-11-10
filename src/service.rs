@@ -21,6 +21,7 @@ pub enum Write {
     },
     Append {
         parent: String,
+        after: Option<String>,
         kind: Kind,
         text: String,
     },
@@ -278,10 +279,15 @@ impl NotionService for ApiService {
                 )
                 .await?;
             }
-            Write::Append { parent, kind, text } => {
+            Write::Append {
+                parent,
+                after,
+                kind,
+                text,
+            } => {
                 self.patch(
                     &format!("/blocks/{parent}/children"),
-                    append_payload(kind, &text),
+                    append_payload(kind, &text, after.as_deref()),
                 )
                 .await?;
             }
@@ -349,7 +355,7 @@ impl NotionService for DemoService {
                 ("paragraph", "Unicode works here: 你好 · café · 🦀", false),
             ]
         };
-        Ok(rows
+        let mut blocks: Vec<_> = rows
             .into_iter()
             .enumerate()
             .map(|(i, (kind, text, children))| {
@@ -359,7 +365,23 @@ impl NotionService for DemoService {
                 kind:{"rich_text":[{"type":"text","plain_text":text}],"checked":false}}),
                 )
             })
-            .collect())
+            .collect();
+        if id != "nested" {
+            blocks.push(BlockItem::from_value(
+                &json!({"id":"demo-rich-text", "type":"paragraph", "paragraph":{"rich_text":[
+                    {"type":"text","plain_text":"Bold", "annotations":{"bold":true}},
+                    {"type":"text","plain_text":" / "},
+                    {"type":"text","plain_text":"italic", "annotations":{"italic":true}},
+                    {"type":"text","plain_text":" / "},
+                    {"type":"text","plain_text":"underline", "annotations":{"underline":true}},
+                    {"type":"text","plain_text":" / "},
+                    {"type":"text","plain_text":"strike", "annotations":{"strikethrough":true}},
+                    {"type":"text","plain_text":" / "},
+                    {"type":"text","plain_text":"Google", "href":"https://www.google.com/"}
+                ]}}),
+            ));
+        }
+        Ok(blocks)
     }
     async fn write(&self, _: Write) -> Result<Option<PageItem>> {
         bail!("Demo is read-only. Connect NOTION_API_TOKEN to save changes")

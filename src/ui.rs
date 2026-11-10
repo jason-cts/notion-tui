@@ -1,7 +1,9 @@
 use crate::{
     app::{App, Confirm, Focus},
     editor::{Buffer, Target},
+    hyperlinks::{self, Links},
     model::BlockLabel,
+    rich_text::{self, RichLine, RichRun},
 };
 use ratatui::{
     Frame,
@@ -22,7 +24,8 @@ const ERROR: Color = Color::Rgb(255, 154, 145);
 #[derive(Default)]
 pub struct Ui {
     pages: ListState,
-    blocks: ListState,
+    block_offset: usize,
+    pub links: Links,
 }
 
 fn clean(text: &str) -> String {
@@ -51,22 +54,28 @@ fn wrapped(text: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn wrapped_block(label: &BlockLabel, width: u16) -> Vec<Line<'static>> {
+fn wrapped_block(label: &BlockLabel, width: u16) -> Vec<RichLine> {
+    if label.rich_text.is_empty() {
+        return rich_text::wrap(&[RichRun::plain(label.plain())], width);
+    }
     let prefix = clean(&label.prefix);
     let indent = UnicodeWidthStr::width(prefix.as_str());
     if indent >= usize::from(width) {
-        return wrapped(&label.plain(), width);
+        let mut runs = vec![RichRun::plain(prefix)];
+        runs.extend(label.rich_text.clone());
+        return rich_text::wrap(&runs, width);
     }
-    wrapped(&label.text, width - indent as u16)
+    rich_text::wrap(&label.rich_text, width - indent as u16)
         .into_iter()
         .enumerate()
-        .map(|(i, line)| {
-            let prefix = if i == 0 {
+        .map(|(index, mut line)| {
+            let prefix = if index == 0 {
                 prefix.clone()
             } else {
                 " ".repeat(indent)
             };
-            Line::raw(format!("{prefix}{line}"))
+            line.runs.insert(0, RichRun::plain(prefix));
+            line
         })
         .collect()
 }
@@ -92,6 +101,7 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 
 impl Ui {
     pub fn draw(&mut self, frame: &mut Frame, app: &App) {
+        self.links.clear();
         let area = frame.area();
         frame.render_widget(
             Block::default().style(Style::default().bg(BG).fg(INK)),
@@ -172,7 +182,7 @@ impl Ui {
         );
         frame.render_widget(
             Paragraph::new(
-                "Tab panes  / search  Enter open  v read  e edit  a append  ? help  q quit",
+                "Tab panes  / search  Enter open  o link  v read  e edit  a append  ? help  q quit",
             )
             .style(Style::default().fg(ACCENT)),
             Rect {
@@ -181,18 +191,68 @@ impl Ui {
                 ..regions[2]
             },
         );
+        if app.help
+            || app.viewer.is_some()
+            || app.search.is_some()
+            || app.editor.is_some()
+            || app.confirm.is_some()
+            || app.link_picker.is_some()
+        {
+            self.links.clear();
+        }
         if app.help {
             self.help(frame, app.help_scroll);
         }
-        if let Some((text, scroll)) = &app.viewer {
+        if let Some((label, scroll)) = &app.viewer {
             let area = popup(frame.area(), 100, frame.area().height.saturating_sub(2));
             frame.render_widget(Clear, area);
-            frame.render_widget(
-                Paragraph::new(clean(text))
-                    .block(panel("FULL BLOCK · ↑/↓ scroll · Esc close".into(), true))
-                    .wrap(Wrap { trim: false })
-                    .scroll((*scroll, 0)),
+            let block = panel("FULL BLOCK · ↑/↓ scroll · o link · Esc close".into(), true);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            for (row, line) in wrapped_block(label, inner.width)
+                .iter()
+                .skip(usize::from(*scroll))
+                .take(usize::from(inner.height))
+                .enumerate()
+            {
+                let row = Rect {
+                    y: inner.y + row as u16,
+                    height: 1,
+                    ..inner
+                };
+                frame.render_widget(Paragraph::new(line.line()), row);
+                hyperlinks::record(&mut self.links, line, row);
+            }
+        }
+        if let Some(picker) = &app.link_picker {
+            self.links.clear();
+            let area = popup(
+                frame.area(),
+                100,
+                frame.area().height.saturating_sub(2).min(24),
+            );
+            frame.render_widget(Clear, area);
+            let items: Vec<_> = picker
+                .links
+                .iter()
+                .map(|(label, url)| {
+                    ListItem::new(vec![
+                        Line::raw(clean(label)),
+                        Line::styled(url.clone(), Style::default().fg(ACCENT)),
+                    ])
+                })
+                .collect();
+            let mut state = ListState::default().with_selected(Some(picker.selected));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(panel(
+                        "OPEN LINK · ↑/↓ choose · Enter browser · Esc cancel".into(),
+                        true,
+                    ))
+                    .highlight_symbol("▌ ")
+                    .highlight_style(Style::default().bg(Color::Rgb(43, 53, 66))),
                 area,
+                &mut state,
             );
         }
         if let Some(buffer) = &app.search {
@@ -219,7 +279,8 @@ impl Ui {
             frame.render_widget(Clear, area);
             let name = match &editor.target {
                 Target::Edit(_) => "EDIT BLOCK",
-                Target::Append(_) => "APPEND BLOCK",
+                Target::Append { after: Some(_), .. } => "APPEND BLOCK · after selected block",
+                Target::Append { after: None, .. } => "APPEND BLOCK · first block",
                 Target::Create(_) => "NEW CHILD PAGE",
             };
             frame.render_widget(
@@ -329,35 +390,74 @@ impl Ui {
                 )
             });
         let block = panel(title, app.focus == Focus::Content);
+        let inner = block.inner(area);
         if app.blocks.is_empty() {
+            self.block_offset = 0;
             frame.render_widget(Paragraph::new(if app.loading_content { "\n  Loading content…" } else if app.path.is_empty() {
                 "\n  Open a page to get started.\n\n  / search your workspace\n  Enter opens a page\n  ? shows all keyboard shortcuts"
             } else { "\n  No blocks here.\n\n  a append a block · n create a child page" }).block(block).wrap(Wrap { trim: false }), area);
-        } else {
-            let items: Vec<_> = app
-                .blocks
+            return;
+        }
+        frame.render_widget(block, area);
+        let rows: Vec<_> = app
+            .block_labels()
+            .iter()
+            .map(|label| {
+                let mut lines = wrapped_block(label, inner.width.saturating_sub(3));
+                lines.push(RichLine::default());
+                lines
+            })
+            .collect();
+        let selected = app.block_selected.min(rows.len() - 1);
+        self.block_offset = self.block_offset.min(selected);
+        while self.block_offset < selected
+            && rows[self.block_offset..=selected]
                 .iter()
-                .zip(app.block_labels())
-                .map(|(b, label)| {
-                    let mut lines = wrapped_block(&label, area.width.saturating_sub(5));
-                    lines.push(Line::raw(""));
-                    let color = if b.block_type.starts_with("heading_") {
-                        ACCENT
+                .map(Vec::len)
+                .sum::<usize>()
+                > usize::from(inner.height)
+        {
+            self.block_offset += 1;
+        }
+        let mut y = inner.y;
+        for (index, lines) in rows.iter().enumerate().skip(self.block_offset) {
+            let color = if app.blocks[index].block_type.starts_with("heading_") {
+                ACCENT
+            } else {
+                INK
+            };
+            let style = Style::default().fg(color).bg(if index == selected {
+                Color::Rgb(43, 53, 66)
+            } else {
+                PANEL
+            });
+            for (row_index, line) in lines.iter().enumerate() {
+                if y >= inner.bottom() {
+                    return;
+                }
+                let row = Rect {
+                    y,
+                    height: 1,
+                    ..inner
+                };
+                frame.render_widget(
+                    Paragraph::new(if index == selected && row_index == 0 {
+                        "▌"
                     } else {
-                        INK
-                    };
-                    ListItem::new(lines).style(Style::default().fg(color))
-                })
-                .collect();
-            self.blocks.select(Some(app.block_selected));
-            frame.render_stateful_widget(
-                List::new(items)
-                    .block(block)
-                    .highlight_symbol("▌ ")
-                    .highlight_style(Style::default().bg(Color::Rgb(43, 53, 66))),
-                area,
-                &mut self.blocks,
-            );
+                        ""
+                    })
+                    .style(style),
+                    row,
+                );
+                let text_area = Rect {
+                    x: inner.x + 2,
+                    width: inner.width.saturating_sub(3),
+                    ..row
+                };
+                frame.render_widget(Paragraph::new(line.line()).style(style), text_area);
+                hyperlinks::record(&mut self.links, line, text_area);
+                y += 1;
+            }
         }
     }
 
@@ -370,11 +470,12 @@ impl Ui {
             "  Tab           Switch panes         Enter    Open page/children\n",
             "  Backspace/←   Back to parent        /        Search page titles\n",
             "  r             Refresh focused pane v        Read full block\n",
+            "  o             Open selected block's link in your browser\n",
             "  q / Ctrl-C    Quit                 ?        Help\n\n",
             "  EDIT\n",
             "  e             Edit selected text block\n",
             "  Space         Toggle selected to-do\n",
-            "  a             Append a block to this location\n",
+            "  a             Insert a block after the selected block\n",
             "  n             Create a child of the current page\n",
             "  Ctrl-S        Save draft            Esc      Cancel draft\n",
             "  Tab           Choose appended block type\n",
@@ -461,7 +562,10 @@ mod tests {
                     .collect();
                 assert!(contents.contains("Hello"));
             }
-            app.editor = Some(crate::editor::Editor::new(Target::Append("p".into())));
+            app.editor = Some(crate::editor::Editor::new(Target::Append {
+                parent: "p".into(),
+                after: None,
+            }));
             app.editor
                 .as_mut()
                 .unwrap()
@@ -472,7 +576,14 @@ mod tests {
             terminal.draw(|f| ui.draw(f, &app)).unwrap();
             app.confirm = None;
             app.editor = None;
-            app.viewer = Some(("Long text\n".repeat(100), 30));
+            app.viewer = Some((
+                BlockLabel {
+                    prefix: String::new(),
+                    text: "Long text\n".repeat(100),
+                    rich_text: vec![RichRun::plain("Long text\n".repeat(100))],
+                },
+                30,
+            ));
             terminal.draw(|f| ui.draw(f, &app)).unwrap();
             app.viewer = None;
             app.help = true;
@@ -496,6 +607,7 @@ mod tests {
         let label = BlockLabel {
             prefix: "    iii. ".into(),
             text: "你好世界\nnext line".into(),
+            rich_text: vec![RichRun::plain("你好世界\nnext line")],
         };
         let lines = wrapped_block(&label, 13)
             .iter()
@@ -552,10 +664,65 @@ mod tests {
                 assert!(contents.contains(&format!("{marker} item12")), "{contents}");
                 app.key(crossterm::event::KeyCode::Char('v').into());
                 assert_eq!(
-                    app.viewer.unwrap().0,
+                    app.viewer.unwrap().0.plain(),
                     format!("{}{marker} item12", "  ".repeat(depth))
                 );
             }
+        }
+    }
+    #[test]
+    fn rich_styles_and_links_survive_wrapping_scrolling_reader_and_overlays() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Arc::new(DemoService), tx, true);
+        app.focus = Focus::Content;
+        let styled = crate::model::BlockItem::from_value(
+            &serde_json::json!({"type":"paragraph", "paragraph":{"rich_text":[
+                {"type":"text","plain_text":"plain "},
+                {"type":"text","plain_text":"BoldItalicStrike", "href":"https://example.com/", "annotations":{"bold":true,"italic":true,"strikethrough":true}},
+                {"type":"text","plain_text":" after"}
+            ]}}),
+        );
+        app.blocks = vec![crate::model::tests::paragraph(); 20];
+        app.blocks.push(styled);
+        app.block_selected = 20;
+        let required =
+            Modifier::BOLD | Modifier::ITALIC | Modifier::CROSSED_OUT | Modifier::UNDERLINED;
+        for width in [25, 45, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let mut ui = Ui::default();
+            for reader in [false, true] {
+                if reader {
+                    app.key(crossterm::event::KeyCode::Char('v').into());
+                }
+                terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+                assert!(!ui.links.is_empty());
+                for (&position, url) in &ui.links {
+                    let cell = &terminal.backend().buffer()[position];
+                    assert_eq!(url, "https://example.com/");
+                    assert!(cell.modifier.contains(required), "{cell:?}");
+                    assert!(!cell.symbol().contains('\x1b'));
+                }
+                let plain_cells: Vec<_> = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .filter(|cell| cell.symbol() == "p")
+                    .collect();
+                assert!(
+                    plain_cells
+                        .iter()
+                        .any(|cell| !cell.modifier.intersects(required))
+                );
+            }
+            app.viewer = None;
+            app.help = true;
+            terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+            assert!(
+                ui.links.is_empty(),
+                "Hidden content must not leave clickable links on a popup"
+            );
+            app.help = false;
         }
     }
 }

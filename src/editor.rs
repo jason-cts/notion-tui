@@ -9,7 +9,10 @@ use crate::{
 #[derive(Clone, Debug)]
 pub enum Target {
     Edit(BlockItem),
-    Append(String),
+    Append {
+        parent: String,
+        after: Option<String>,
+    },
     Create(String),
 }
 
@@ -67,7 +70,13 @@ impl Buffer {
     }
 
     pub fn key(&mut self, key: KeyEvent, multiline: bool) {
-        match key.code {
+        // Some terminals send BS (Ctrl-H) instead of DEL for Backspace.
+        // Crossterm reports BS as Ctrl-H, so normalize it for all text fields.
+        let code = match key.code {
+            KeyCode::Char('h') if key.modifiers == KeyModifiers::CONTROL => KeyCode::Backspace,
+            code => code,
+        };
+        match code {
             KeyCode::Char(c)
                 if !key
                     .modifiers
@@ -139,7 +148,7 @@ impl Editor {
     }
 
     pub fn cycle_kind(&mut self) {
-        if matches!(self.target, Target::Append(_)) {
+        if matches!(self.target, Target::Append { .. }) {
             let index = Kind::ALL.iter().position(|k| *k == self.kind).unwrap_or(0);
             self.kind = Kind::ALL[(index + 1) % Kind::ALL.len()];
         }
@@ -154,8 +163,9 @@ impl Editor {
                 original: original.clone(),
                 text: Some(self.buffer.text.clone()),
             },
-            Target::Append(parent) => Write::Append {
+            Target::Append { parent, after } => Write::Append {
                 parent: parent.clone(),
+                after: after.clone(),
                 kind: self.kind,
                 text: self.buffer.text.clone(),
             },

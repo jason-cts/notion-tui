@@ -31,7 +31,11 @@ Demo content is read-only. `cargo run -- --help` shows command-line usage. A ter
 
 ## OAuth login
 
-If `NOTION_API_TOKEN` is unset or blank, the app restores a saved OAuth session or opens your browser to log in. A nonempty API token takes precedence and does not require OAuth configuration.
+If `NOTION_API_TOKEN` is unset or blank and OAuth client credentials are missing, the app opens a **Connect to Notion** screen. Enter an API token, or press F2 to select OAuth and enter a client ID, client secret, and registered redirect URI. Existing OAuth environment values prefill the form. Tab or the arrow keys move between fields; Enter advances or connects, Ctrl-S connects from any field, and Esc or Ctrl-C cancels. Tokens and client secrets are masked, and bracketed paste is supported.
+
+API tokens entered interactively are used for that run and are not saved. OAuth client credentials also stay in memory; access and refresh tokens from successful OAuth login are saved as described below. You can enter the client credentials again on later runs or set the environment variables to skip setup. `--login` restricts setup to OAuth.
+
+When OAuth client credentials are already configured in the environment, the app restores a saved session or opens your browser directly. A nonempty API token takes precedence and does not require OAuth configuration.
 
 Create your own OAuth integration in the [Notion developer portal](https://www.notion.so/profile/integrations), enable read/insert/update content capabilities, and register this exact redirect URI in its OAuth configuration:
 
@@ -48,7 +52,7 @@ export NOTION_OAUTH_CLIENT_SECRET='your-client-secret'
 cargo run --release
 ```
 
-The browser prompts you to choose a workspace and share pages. Return to the terminal after allowing access. The terminal also prints the login URL if the browser does not open. Login times out after five minutes; Ctrl-C cancels it. This uses Notion's [authorization-code flow](https://developers.notion.com/guides/authorization/overview). The client secret is supplied locally and is never bundled with the application or saved to disk. Keep the client variables available on subsequent runs so the app can refresh expired credentials. Environment files are not loaded automatically.
+The browser prompts you to choose a workspace and share pages. Return to the terminal after allowing access. The terminal also prints the login URL if the browser does not open. Login times out after five minutes; Ctrl-C cancels it. This uses Notion's [authorization-code flow](https://developers.notion.com/guides/authorization/overview). The client secret is supplied locally and is never bundled with the application or saved to disk. Supply the client credentials through the form or environment on subsequent runs so the app can refresh expired credentials. Environment files are not loaded automatically.
 
 To use another callback port, set `NOTION_OAUTH_REDIRECT_URI` to an HTTP loopback URI with an explicit port and register that exact URI with Notion. The listener binds only to a loopback address. If running over SSH, forward the callback port, for example `ssh -L 8765:127.0.0.1:8765 your-host`, and open the printed URL in your local browser. Choose another registered port if 8765 is occupied.
 
@@ -75,14 +79,19 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | `/` | Search page titles; Enter submits, Esc cancels |
 | `r` | Refresh the focused pane |
 | `v` | Open the full block in a scrollable reader |
+| `o` | Open the selected block's external link in your browser; choose when it contains multiple links |
 | `e` | Edit a paragraph, heading, list item, or to-do |
 | Space | Toggle a to-do without changing its rich text |
-| `a` | Append a block to the current location |
+| `a` | Insert a block immediately after the selected block; create the first block in an empty location |
 | `n` | Create a child of the current page, including when viewing nested blocks |
 | `?` | Keyboard help |
 | `q` / Ctrl-C | Quit |
 
-The editor supports multiline text, Unicode, bracketed paste, arrows, and Home/End. Tab cycles the type of an appended block: paragraph, three heading levels, bullet, numbered item, or to-do. Ctrl-S saves; Esc asks before discarding the draft. In the full-block reader and help, ↑/↓ or `j`/`k` scroll, PageUp/PageDown move ten lines, and another key closes the reader.
+The editor supports multiline text, Unicode, bracketed paste, arrows, and Home/End. Tab cycles the type of an inserted block: paragraph, three heading levels, bullet, numbered item, or to-do. Ctrl-S saves; Esc asks before discarding the draft. In the full-block reader and help, ↑/↓ or `j`/`k` scroll and PageUp/PageDown move ten lines. In the reader, `o` opens its external links; another key closes it.
+
+Insertion stays at the current nesting level, directly after the block selected when you pressed `a`. Saving refreshes the list and selects the block just after that anchor. Failed saves retain the draft and its insertion point.
+
+Notion bold, italic, underline, and strikethrough annotations render as terminal styles, including combined styles within a block. Wrapping and the full-block reader preserve these spans. Exact appearance depends on your terminal and font. HTTP/HTTPS links appear cyan and underlined and emit OSC 8 hyperlinks for terminals that support clicking them. Use your terminal's usual link-opening gesture, or press `o` to launch the default browser. For a block with several targets, use ↑/↓ and Enter in the link chooser; Esc cancels. Browsing content alone never launches a browser.
 
 Consecutive numbered-list siblings count upward and restart after another block type. Nested list items indent and cycle through decimal, lowercase letters, and lowercase Roman numerals. Opening a child page resets the nesting context. The full-block reader uses the same numbering as the content pane.
 
@@ -101,6 +110,7 @@ Drafts and navigation state live in memory. Quitting discards them. During a sav
 - `src/service.rs`: `NotionService`, rusticnotion reads/page creation, and a small reqwest block-write adapter.
 - `src/auth.rs` and `src/auth/`: OAuth authorization, callback handling, rotating sessions, and private credential storage.
 - `src/model.rs`: display models and minimal block-write payloads.
+- `src/rich_text.rs` and `src/hyperlinks.rs`: styled spans, Unicode wrapping, and OSC 8 output kept separate from Ratatui cell symbols.
 - `src/ui.rs`: responsive ratatui rendering.
 
 The sibling rusticnotion patches update the API header, default omitted child arrays, encode opaque cursors, add paginated page searches and shallow block reads, expose a test/proxy endpoint, and report rate-limit waiting times. They also fix an existing recursive-helper compile error and propagate child-read failures. Table rows now decode arrays of rich-text arrays, and page/database mentions decode ID references. The corrected table-cell and mention field types affect callers constructing those models directly; child collection field types remain unchanged.
@@ -114,10 +124,11 @@ cargo test
 cargo build
 python3 tests/terminal_smoke.py
 python3 tests/auth_smoke.py
+python3 tests/rich_text_smoke.py
 
 cargo fmt --manifest-path ../rusticnotion/Cargo.toml --check
 CARGO_HUSKY_DONT_INSTALL_HOOKS=1 cargo test --manifest-path ../rusticnotion/Cargo.toml --lib
 CARGO_HUSKY_DONT_INSTALL_HOOKS=1 cargo clippy --manifest-path ../rusticnotion/Cargo.toml --lib
 ```
 
-Unit and HTTP mock tests need no credentials; mocks bind local ports. The terminal smoke tests use Linux pseudo-terminals to exercise search, nested navigation, draft recovery, resizing, terminal restoration, and OAuth cancellation/denial before terminal mode. The OAuth smoke test disables desktop launchers and never contacts Notion. rusticnotion's existing integration tests contact Notion and require credentials; the `--lib` command intentionally runs only credential-free library tests.
+Unit and HTTP mock tests need no credentials; mocks bind local ports. The terminal smoke tests use Linux pseudo-terminals to exercise search, nested navigation, draft recovery, resizing, terminal restoration, interactive authentication, OAuth cancellation/denial, text styles, and hyperlinks. The authentication smoke test disables desktop launchers; the rich-text smoke test uses a fake browser to verify URL dispatch. Neither contacts Notion. rusticnotion's existing integration tests contact Notion and require credentials; the `--lib` command intentionally runs only credential-free library tests.
