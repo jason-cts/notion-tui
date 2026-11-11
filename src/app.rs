@@ -1,5 +1,9 @@
+use crate::database::{DatabaseData, DatabaseMeta, DatabaseState, supported};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
+
+mod database;
 
 use crate::{
     editor::{Buffer, Editor, Target},
@@ -13,16 +17,38 @@ pub enum Focus {
     Content,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocationKind {
+    Page,
+    Blocks,
+    Database,
+}
+
 #[derive(Clone, Debug)]
 pub struct Location {
     pub id: String,
     pub title: String,
-    pub is_page: bool,
+    pub kind: LocationKind,
     pub page_id: String,
     pub list_depth: usize,
 }
 
 pub enum Message {
+    DatabaseMeta {
+        id: String,
+        generation: u64,
+        result: Result<DatabaseMeta, String>,
+    },
+    DatabaseRows {
+        id: String,
+        generation: u64,
+        result: Result<Box<DatabaseData>, String>,
+    },
+    DatabaseProgress {
+        id: String,
+        generation: u64,
+        count: usize,
+    },
     Browser(Result<(), String>),
     Search {
         generation: u64,
@@ -48,6 +74,9 @@ pub struct LinkPicker {
 }
 
 pub struct App {
+    pub databases: HashMap<String, DatabaseState>,
+    metadata_pending: HashSet<String>,
+    metadata_generations: HashMap<String, u64>,
     pub pages: Vec<PageItem>,
     pub blocks: Vec<BlockItem>,
     pub page_selected: usize,
@@ -83,6 +112,9 @@ impl App {
             service,
             sender,
             demo,
+            databases: HashMap::new(),
+            metadata_pending: HashSet::new(),
+            metadata_generations: HashMap::new(),
             pages: vec![],
             blocks: vec![],
             page_selected: 0,
@@ -143,6 +175,11 @@ impl App {
             return;
         };
         self.content_generation += 1;
+        if location.kind == LocationKind::Database {
+            self.blocks.clear();
+            self.load_database(false);
+            return;
+        }
         self.loading_content = true;
         self.blocks.clear();
         self.block_selected = 0;
@@ -151,7 +188,7 @@ impl App {
         let sender = self.sender.clone();
         tokio::spawn(async move {
             let result = async {
-                if location.is_page {
+                if location.kind == LocationKind::Page {
                     location.title = service.page(&location.id).await?.title;
                 }
                 let blocks = service.children(&location.id).await?;
@@ -168,7 +205,7 @@ impl App {
             page_id: page.id.clone(),
             id: page.id,
             title: page.title,
-            is_page: true,
+            kind: LocationKind::Page,
             list_depth: 0,
         }];
         self.focus = Focus::Content;
@@ -189,6 +226,27 @@ impl App {
 
     pub fn receive(&mut self, message: Message) {
         match message {
+            Message::DatabaseMeta {
+                id,
+                generation,
+                result,
+            } => self.receive_database_meta(id, generation, result),
+            Message::DatabaseRows {
+                id,
+                generation,
+                result,
+            } => self.receive_database_rows(id, generation, result.map(|data| *data)),
+            Message::DatabaseProgress {
+                id,
+                generation,
+                count,
+            } => {
+                if let Some(db) = self.databases.get_mut(&id)
+                    && db.generation == generation
+                {
+                    db.progress = count;
+                }
+            }
             Message::Browser(Ok(())) => {
                 self.status = "Opened link in your browser".into();
                 self.error = false;
@@ -223,6 +281,7 @@ impl App {
                             *last = location;
                         }
                         self.blocks = blocks;
+                        self.ensure_database_metadata(false);
                         self.error = false;
                         self.status = format!(
                             "{} blocks · e edit · a append · n child page",
@@ -285,7 +344,12 @@ impl App {
         }
     }
 
-    pub fn key(&mut self, key: KeyEvent) {
+    pub fn key(&mut self, mut key: KeyEvent) {
+        // Terminals can send BS (Ctrl-H) or DEL for the Backspace key.
+        if key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::CONTROL {
+            key.code = KeyCode::Backspace;
+            key.modifiers = KeyModifiers::NONE;
+        }
         if self.saving {
             return;
         }
@@ -385,6 +449,9 @@ impl App {
                 }
                 _ => search.key(key, false),
             }
+            return;
+        }
+        if self.database_key(key) {
             return;
         }
         match key.code {
@@ -489,6 +556,7 @@ impl App {
             }
             _ => {}
         }
+        self.ensure_database_metadata(false);
     }
 
     fn open_links(&mut self) {
@@ -526,13 +594,27 @@ impl App {
             {
                 self.open_page(page);
             }
-        } else if let Some(block) = self.blocks.get(self.block_selected).cloned() {
-            if block.child_page {
+        } else if !self.loading_content
+            && let Some(block) = self.blocks.get(self.block_selected).cloned()
+        {
+            if block.block_type == "child_database" {
+                self.path.push(Location {
+                    id: block.id,
+                    title: block.text,
+                    kind: LocationKind::Database,
+                    page_id: self
+                        .location()
+                        .map(|l| l.page_id.clone())
+                        .unwrap_or_default(),
+                    list_depth: 0,
+                });
+                self.load();
+            } else if block.child_page {
                 let page_id = block.id.clone();
                 self.path.push(Location {
                     id: block.id,
                     title: block.text,
-                    is_page: true,
+                    kind: LocationKind::Page,
                     page_id,
                     list_depth: 0,
                 });
@@ -547,7 +629,7 @@ impl App {
                 self.path.push(Location {
                     id: block.id,
                     title: block.text,
-                    is_page: false,
+                    kind: LocationKind::Blocks,
                     page_id,
                     list_depth,
                 });

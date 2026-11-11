@@ -4,7 +4,7 @@ use wiremock::{
     matchers::{body_json, body_partial_json, header, method, path, query_param},
 };
 
-fn page(id: &str, title: &str) -> Value {
+pub(super) fn page(id: &str, title: &str) -> Value {
     json!({"object":"page","id":id,"created_time":"2026-01-01T00:00:00Z",
         "last_edited_time":"2026-01-01T00:00:00Z","in_trash":false,"icon":null,
         "parent":{"type":"workspace","workspace":true},
@@ -310,7 +310,11 @@ async fn insertion_uses_selected_anchor_and_focuses_the_new_sibling_after_refres
         app.path.push(Location {
             id: parent.into(),
             title: parent.into(),
-            is_page,
+            kind: if is_page {
+                crate::app::LocationKind::Page
+            } else {
+                crate::app::LocationKind::Blocks
+            },
             page_id: "page".into(),
             list_depth: usize::from(!is_page),
         });

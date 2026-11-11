@@ -166,9 +166,10 @@ impl BlockItem {
         } else {
             self.text.clone()
         };
+        let expandable = self.children || self.block_type == "child_database";
         BlockLabel {
             prefix: format!("{}{marker}", "  ".repeat(depth)),
-            text: format!("{text}{}", if self.children { "  ›" } else { "" }),
+            text: format!("{text}{}", if expandable { "  ›" } else { "" }),
             rich_text: {
                 let mut runs = if !self.text.is_empty()
                     && self
@@ -182,7 +183,7 @@ impl BlockItem {
                 } else {
                     vec![RichRun::plain(text)]
                 };
-                if self.children {
+                if expandable {
                     runs.push(RichRun::plain("  ›"));
                 }
                 runs
@@ -311,6 +312,30 @@ pub(crate) mod tests {
             &json!({"id":"block", "type":"paragraph", "last_edited_time":"before",
             "paragraph":{"rich_text":[{"type":"text","plain_text":"Hello","text":{"content":"Hello"}}]}}),
         )
+    }
+
+    #[test]
+    fn child_databases_show_the_child_indicator_without_block_children() {
+        for has_children in [None, Some(false), Some(true)] {
+            let mut value = json!({
+                "id": "db", "type": "child_database",
+                "child_database": {"title": "Tasks"}
+            });
+            if let Some(has_children) = has_children {
+                value["has_children"] = json!(has_children);
+            }
+            let label = BlockItem::from_value(&value).label(1, 0);
+            assert_eq!(label.plain(), "Tasks  ›");
+            assert_eq!(
+                label
+                    .rich_text
+                    .iter()
+                    .map(|r| r.text.as_str())
+                    .collect::<String>(),
+                "Tasks  ›"
+            );
+        }
+        assert_eq!(paragraph().label(1, 0).plain(), "Hello");
     }
 
     #[test]

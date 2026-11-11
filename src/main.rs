@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod cli;
+mod database;
 mod editor;
 mod hyperlinks;
 mod model;

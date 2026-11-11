@@ -8,7 +8,7 @@ fn app() -> (App, mpsc::UnboundedReceiver<Message>) {
     app.path.push(Location {
         id: "page".into(),
         title: "Page".into(),
-        is_page: true,
+        kind: LocationKind::Page,
         page_id: "page".into(),
         list_depth: 0,
     });
@@ -19,6 +19,154 @@ fn app() -> (App, mpsc::UnboundedReceiver<Message>) {
 
 fn ctrl_s() -> KeyEvent {
     KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+}
+
+async fn drain_content(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while app.loading_content {
+            app.receive(rx.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn child_database_opens_switches_views_and_restores_row_after_page_navigation() {
+    let (mut app, mut rx) = app();
+    app.blocks = vec![BlockItem::from_value(
+        &serde_json::json!({"id":"demo-database","type":"child_database","child_database":{"title":"Tasks"},"has_children":false}),
+    )];
+    app.key(KeyCode::Enter.into());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.location().unwrap().kind, LocationKind::Database);
+    assert_eq!(app.database().unwrap().view().unwrap().view_type, "list");
+    app.key(KeyCode::Char(']').into());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.database().unwrap().view().unwrap().view_type, "board");
+    app.key(KeyCode::Right.into());
+    assert_eq!(app.database().unwrap().selected, 1);
+    app.key(KeyCode::Enter.into());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.location().unwrap().id, "demo-row-1");
+    app.key(KeyCode::Backspace.into());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.database().unwrap().view().unwrap().view_type, "board");
+    assert_eq!(app.database().unwrap().selected, 1);
+    for key in ['e', 'a', 'n', ' '] {
+        app.key(KeyCode::Char(key).into());
+        assert!(app.editor.is_none());
+        assert!(!app.saving);
+    }
+    app.key(KeyCode::Char('v').into());
+    assert!(app.viewer.as_ref().unwrap().0.text.contains("Beta"));
+    app.key(KeyCode::Esc.into());
+    app.key(KeyCode::Char('o').into());
+    assert_eq!(app.pending_link.as_deref(), Some("https://example.com/"));
+}
+
+#[tokio::test]
+async fn left_and_both_backspace_encodings_return_from_every_database_layout() {
+    for (view_index, layout) in ["list", "board", "table"].into_iter().enumerate() {
+        for back in [
+            KeyCode::Left.into(),
+            KeyCode::Backspace.into(),
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        ] {
+            let (mut app, mut rx) = app();
+            app.blocks = vec![BlockItem::from_value(&serde_json::json!({
+                "id":"demo-database", "type":"child_database",
+                "child_database":{"title":"Tasks"}, "has_children":false
+            }))];
+            app.key(KeyCode::Enter.into());
+            drain_content(&mut app, &mut rx).await;
+            for _ in 0..view_index {
+                app.key(KeyCode::Char(']').into());
+                drain_content(&mut app, &mut rx).await;
+            }
+            assert_eq!(app.database().unwrap().view().unwrap().view_type, layout);
+            app.key(back);
+            assert_eq!(app.path.len(), 1, "{layout}: {back:?}");
+            assert_eq!(app.location().unwrap().id, "page");
+            assert_eq!(app.location().unwrap().kind, LocationKind::Page);
+            assert_eq!(app.focus, Focus::Content);
+            drain_content(&mut app, &mut rx).await;
+            assert!(app.database().is_none());
+            assert!(!app.blocks.is_empty());
+        }
+    }
+}
+
+#[test]
+fn database_messages_are_generation_checked_and_view_type_is_shown_in_header() {
+    let (mut app, _) = app();
+    let meta = crate::service::database::demo_metadata("db");
+    let data = crate::service::database::demo_data(meta.views[0].clone());
+    app.databases.insert(
+        "db".into(),
+        DatabaseState {
+            generation: 2,
+            meta: Some(meta),
+            data: Some(data),
+            ..Default::default()
+        },
+    );
+    app.receive(Message::DatabaseRows {
+        id: "db".into(),
+        generation: 1,
+        result: Err("obsolete failure".into()),
+    });
+    assert!(app.databases["db"].error.is_none());
+    let block = BlockItem::from_value(
+        &serde_json::json!({"id":"db","type":"child_database","child_database":{"title":"Tasks"}}),
+    );
+    assert_eq!(app.content_type(&block), "child_database (list)");
+    app.receive(Message::DatabaseProgress {
+        id: "db".into(),
+        generation: 1,
+        count: 100,
+    });
+    assert_eq!(app.databases["db"].progress, 0);
+}
+
+#[tokio::test]
+async fn switching_to_an_unsupported_view_invalidates_an_inflight_load() {
+    let (mut app, _) = app();
+    app.path.push(Location {
+        id: "db".into(),
+        title: "DB".into(),
+        kind: LocationKind::Database,
+        page_id: "page".into(),
+        list_depth: 0,
+    });
+    let mut meta = crate::service::database::demo_metadata("db");
+    meta.views[1].view_type = "gallery".into();
+    let old_data = crate::service::database::demo_data(meta.views[0].clone());
+    app.databases.insert(
+        "db".into(),
+        DatabaseState {
+            meta: Some(meta),
+            generation: 0,
+            ..Default::default()
+        },
+    );
+    app.key(KeyCode::Char(']').into());
+    assert!(!app.loading_content);
+    assert!(
+        app.database()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("gallery")
+    );
+    app.receive(Message::DatabaseRows {
+        id: "db".into(),
+        generation: 0,
+        result: Ok(Box::new(old_data)),
+    });
+    assert!(app.database().unwrap().data.is_none());
+    assert_eq!(app.database().unwrap().view().unwrap().view_type, "gallery");
 }
 
 #[test]
@@ -72,7 +220,7 @@ fn append_captures_the_selected_sibling_and_its_parent() {
     app.path.push(Location {
         id: "nested".into(),
         title: "Nested".into(),
-        is_page: false,
+        kind: LocationKind::Blocks,
         page_id: "page".into(),
         list_depth: 1,
     });
@@ -172,7 +320,7 @@ async fn stale_search_and_content_responses_cannot_replace_current_state() {
             Location {
                 id: "old".into(),
                 title: "Old".into(),
-                is_page: true,
+                kind: LocationKind::Page,
                 page_id: "old".into(),
                 list_depth: 0,
             },
@@ -302,4 +450,22 @@ async fn list_depth_survives_refresh_and_back_navigation_but_resets_at_pages() {
         app.receive(rx.recv().await.unwrap());
         assert_eq!(app.location().unwrap().list_depth, depth);
     }
+}
+
+#[tokio::test]
+async fn untitled_database_metadata_keeps_the_child_block_title() {
+    let (mut app, mut rx) = app();
+    app.path.push(Location {
+        id: "db".into(),
+        title: "table view database".into(),
+        kind: LocationKind::Database,
+        page_id: "page".into(),
+        list_depth: 0,
+    });
+    app.metadata_generations.insert("db".into(), 1);
+    let mut meta = crate::service::database::demo_metadata("db");
+    meta.title = "Untitled".into();
+    app.receive_database_meta("db".into(), 1, Ok(meta));
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.location().unwrap().title, "table view database");
 }

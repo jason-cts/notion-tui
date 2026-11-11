@@ -1,6 +1,6 @@
 # Notion TUI
 
-A keyboard-driven Notion client built with ratatui and [rusticnotion](https://github.com/jason-cts/rusticnotion). Search shared pages, explore nested blocks, edit text, toggle tasks, append blocks, and create child pages.
+A keyboard-driven Notion client built with ratatui and [rusticnotion](https://github.com/jason-cts/rusticnotion). Search shared pages, browse databases, explore nested blocks, edit text, toggle tasks, append blocks, and create child pages.
 
 ## Run
 
@@ -73,7 +73,10 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | `g`/`G`, Home/End | First/last item |
 | Tab | Switch pages/content panes |
 | Enter | Open a page or a block's children |
-| Backspace or ← | Return to parent |
+| Backspace | Return to parent |
+| ← | Return to parent, including from a database |
+| `[` / `]` | Previous/next saved database view |
+| `h`/`l` | Move between board columns or scroll table columns; → also moves right |
 | `/` | Search page titles; Enter submits, Esc cancels |
 | `r` | Refresh the focused pane |
 | `v` | Open the full block in a scrollable reader |
@@ -93,6 +96,26 @@ Notion bold, italic, underline, and strikethrough annotations render as terminal
 
 Consecutive numbered-list siblings count upward and restart after another block type. Nested list items indent and cycle through decimal, lowercase letters, and lowercase Roman numerals. Opening a child page resets the nesting context. The full-block reader uses the same numbering as the content pane.
 
+## Child databases
+
+Selecting a child database loads its saved view metadata and shows the layout in the content title, for example `child_database (list)`. Enter opens the database. The first supported saved view is selected initially; `[` and `]` switch views and the choice is remembered for this session. Each view uses its own data source, saved filters, and saved sorts through Notion's Views API.
+
+List views show page titles and visible properties. Tables preserve saved column order, visibility, wrapping, and frozen columns, with widths adapted to terminal cells. Boards show grouped cards, counts, visible properties, and subgroup sections. Use Up/Down or `j`/`k` to select rows/cards, and `h`/`l` to navigate board columns or scroll a table. Enter opens the selected page; Left or Backspace returns to the parent, including from the database itself. Returning from a row page restores its database selection. `v` opens row details, `o` opens external links, and `r` refreshes metadata and rows. Database screens are read-only; existing content-editing commands work after opening a page.
+
+Grouping supports status groups/options, select, multi-select, checkbox, people, creator/editor, relations, text/prefixes, numbers/ranges, dates, and formula results. Multi-valued properties can show the same page in several groups. Missing values appear under **No value**. Date grouping uses the terminal's local timezone and the saved week start. Manual group ordering uses schema order when available and first-seen query order otherwise; a notice explains where ordering can differ from Notion's web UI. Sub-items are displayed as flat rows, and image covers are omitted. Other view layouts remain selectable with an unsupported-layout message. Unknown future grouping types fall back to a list with a notice.
+
+Property matching accepts both raw IDs from saved views and percent-encoded IDs from schemas and pages. Status columns follow schema workflow order, and empty card properties are omitted. Column names and row order come from the API. When a view has no saved sort, a notice explains that API row order may differ from the web's manual order.
+
+Queries load all result pages and hydrate properties used by the view. Temporary query caches are deleted after loading; cleanup failure does not discard rows. Explicit rate-limit responses are retried up to three times using Notion's waiting interval. An expired query restarts once. These operations do not edit saved views, database schemas, or pages.
+
+The table-view compatibility fix for `frozen_column_index: -1` is implemented in the sibling `../rusticnotion` working tree. Until that revision is published to GitHub and adopted in `Cargo.lock`, use a temporary local override for development:
+
+```sh
+cargo --config 'patch."https://github.com/jason-cts/rusticnotion.git".rusticnotion.path="../rusticnotion"' run -- --demo
+```
+
+Cargo may temporarily resolve that checkout into the lockfile. The declared dependency stays on Git; after publishing rusticnotion, run `cargo update -p rusticnotion` without the override and repeat the locked checks below.
+
 ## Saving
 
 Editing replaces a block's rich text with plain text. Styled text and links require confirmation before replacement. Block colors, child blocks, and a to-do's checked state are preserved when editing text. Mentions, inline equations, and unsupported block types are read-only.
@@ -108,6 +131,7 @@ Drafts and navigation state live in memory. Quitting discards them. During a sav
 - `src/service.rs`: `NotionService`, rusticnotion reads/page creation, and a small reqwest block-write adapter.
 - `src/auth.rs` and `src/auth/`: OAuth authorization, callback handling, rotating sessions, and private credential storage.
 - `src/model.rs`: display models and minimal block-write payloads.
+- `src/database.rs` and the database submodules under app/service/ui: saved views, property formatting, grouping, navigation, and rendering.
 - `src/rich_text.rs` and `src/hyperlinks.rs`: styled spans, Unicode wrapping, and OSC 8 output kept separate from Ratatui cell symbols.
 - `src/ui.rs`: responsive ratatui rendering.
 
@@ -123,6 +147,7 @@ cargo build --locked
 python3 tests/terminal_smoke.py
 python3 tests/auth_smoke.py
 python3 tests/rich_text_smoke.py
+python3 tests/database_smoke.py
 ```
 
-Unit and HTTP mock tests need no credentials; mocks bind local ports. The terminal smoke tests use Linux pseudo-terminals to exercise search, nested navigation, draft recovery, resizing, terminal restoration, interactive authentication, OAuth cancellation/denial, text styles, and hyperlinks. The authentication smoke test disables desktop launchers; the rich-text smoke test uses a fake browser to verify URL dispatch. Neither contacts Notion. The library's own tests are maintained in the rusticnotion repository.
+Unit and HTTP mock tests need no credentials; mocks bind local ports. The terminal smoke tests use Linux pseudo-terminals to exercise search, nested navigation, draft recovery, resizing, terminal restoration, interactive authentication, OAuth cancellation/denial, text styles, hyperlinks, and database list/board/table navigation. The authentication smoke test disables desktop launchers; the rich-text smoke test uses a fake browser to verify URL dispatch. None contacts Notion. The library's own tests are maintained in the rusticnotion repository.

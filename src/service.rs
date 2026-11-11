@@ -11,7 +11,12 @@ use rusticnotion::{
 use serde_json::{Value, json};
 
 use crate::auth::{AuthError, OAuthSession, is_unauthorized};
+use crate::database::{DatabaseData, DatabaseMeta};
 use crate::model::{BlockItem, Kind, PageItem, append_payload, update_payload};
+use rusticnotion::models::view::View;
+
+pub(crate) mod database;
+pub type Progress = Arc<dyn Fn(usize) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub enum Write {
@@ -37,6 +42,12 @@ pub trait NotionService: Send + Sync {
     async fn page(&self, id: &str) -> Result<PageItem>;
     async fn children(&self, id: &str) -> Result<Vec<BlockItem>>;
     async fn write(&self, write: Write) -> Result<Option<PageItem>>;
+    async fn database(&self, _id: &str) -> Result<DatabaseMeta> {
+        bail!("Database browsing is unavailable")
+    }
+    async fn database_rows(&self, _view: &View, _progress: Progress) -> Result<DatabaseData> {
+        bail!("Database views are unavailable")
+    }
 }
 
 pub struct ApiService {
@@ -154,6 +165,21 @@ impl OAuthService {
 
 #[async_trait]
 impl NotionService for OAuthService {
+    async fn database(&self, id: &str) -> Result<DatabaseMeta> {
+        self.read(|api| {
+            let id = id.to_owned();
+            async move { api.database(&id).await }
+        })
+        .await
+    }
+    async fn database_rows(&self, view: &View, progress: Progress) -> Result<DatabaseData> {
+        self.read(|api| {
+            let view = view.clone();
+            let progress = progress.clone();
+            async move { api.database_rows(&view, progress).await }
+        })
+        .await
+    }
     async fn search(&self, query: &str) -> Result<Vec<PageItem>> {
         self.read(|api| {
             let query = query.to_owned();
@@ -216,6 +242,12 @@ fn next_cursor<T: serde::Serialize>(
 
 #[async_trait]
 impl NotionService for ApiService {
+    async fn database(&self, id: &str) -> Result<DatabaseMeta> {
+        self.database_metadata(id).await
+    }
+    async fn database_rows(&self, view: &View, progress: Progress) -> Result<DatabaseData> {
+        self.load_database_rows(view, progress).await
+    }
     async fn search(&self, query: &str) -> Result<Vec<PageItem>> {
         let mut pages = Vec::new();
         let mut cursor = None;
@@ -319,6 +351,14 @@ pub struct DemoService;
 
 #[async_trait]
 impl NotionService for DemoService {
+    async fn database(&self, id: &str) -> Result<DatabaseMeta> {
+        Ok(database::demo_metadata(id))
+    }
+    async fn database_rows(&self, view: &View, progress: Progress) -> Result<DatabaseData> {
+        let data = database::demo_data(view.clone());
+        progress(data.rows.len());
+        Ok(data)
+    }
     async fn search(&self, query: &str) -> Result<Vec<PageItem>> {
         Ok(vec![PageItem {
             id: "demo".into(),
@@ -380,6 +420,7 @@ impl NotionService for DemoService {
                     {"type":"text","plain_text":"Google", "href":"https://www.google.com/"}
                 ]}}),
             ));
+            blocks.insert(blocks.len().saturating_sub(1),BlockItem::from_value(&json!({"id":"demo-database","type":"child_database","child_database":{"title":"Task database"},"has_children":false})));
         }
         Ok(blocks)
     }

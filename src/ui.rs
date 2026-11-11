@@ -12,6 +12,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+
+mod database;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACCENT: Color = Color::Rgb(104, 211, 195);
@@ -25,6 +27,7 @@ const ERROR: Color = Color::Rgb(255, 154, 145);
 pub struct Ui {
     pages: ListState,
     block_offset: usize,
+    database_offsets: std::collections::HashMap<String, usize>,
     pub links: Links,
 }
 
@@ -182,7 +185,8 @@ impl Ui {
         );
         frame.render_widget(
             Paragraph::new(
-                "Tab panes  / search  Enter open  o link  v read  e edit  a append  ? help  q quit",
+                if app.database().is_some() { "[ / ] views  h/l columns  Enter page  ←/Backspace parent  v details  o link  r refresh  q quit" }
+                else { "Tab panes  / search  Enter open  o link  v read  e edit  a append  ? help  q quit" },
             )
             .style(Style::default().fg(ACCENT)),
             Rect {
@@ -378,13 +382,17 @@ impl Ui {
     }
 
     fn content(&mut self, frame: &mut Frame, app: &App, area: Rect) {
+        if app.database().is_some() {
+            self.database_content(frame, app, area);
+            return;
+        }
         let title = app
             .blocks
             .get(app.block_selected)
             .map_or("CONTENT".into(), |b| {
                 format!(
                     "CONTENT · {} · {}/{}",
-                    b.block_type,
+                    app.content_type(b),
                     app.block_selected + 1,
                     app.blocks.len()
                 )
@@ -467,8 +475,8 @@ impl Ui {
         let text = concat!(
             "\n  NAVIGATE\n",
             "  ↑/↓ or j/k    Move selection       g/G      First/last\n",
-            "  Tab           Switch panes         Enter    Open page/children\n",
-            "  Backspace/←   Back to parent        /        Search page titles\n",
+            "  Tab           Switch panes         Enter    Open page/children\n  [ / ]         Database views       h/l      Columns / table scroll\n",
+            "  ←/Backspace   Back to parent        /        Search page titles\n",
             "  r             Refresh focused pane v        Read full block\n",
             "  o             Open selected block's link in your browser\n",
             "  q / Ctrl-C    Quit                 ?        Help\n\n",
@@ -641,7 +649,7 @@ mod tests {
                 app.path.push(crate::app::Location {
                     id: "list".into(),
                     title: "List".into(),
-                    is_page: false,
+                    kind: crate::app::LocationKind::Blocks,
                     page_id: "page".into(),
                     list_depth: depth,
                 });
