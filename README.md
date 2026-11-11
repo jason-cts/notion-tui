@@ -1,18 +1,16 @@
 # Notion TUI
 
-A keyboard-driven Notion client built with ratatui and your local rusticnotion checkout. Search shared pages, explore nested blocks, edit text, toggle tasks, append blocks, and create child pages.
+A keyboard-driven Notion client built with ratatui and [rusticnotion](https://github.com/jason-cts/rusticnotion). Search shared pages, explore nested blocks, edit text, toggle tasks, append blocks, and create child pages.
 
 ## Run
 
-Keep the repositories side by side:
+Cargo fetches rusticnotion directly from your GitHub repository over SSH:
 
-```text
-cts/
-├── notion-tui/
-└── rusticnotion/
+```toml
+rusticnotion = { git = "ssh://git@github.com/jason-cts/rusticnotion.git" }
 ```
 
-The dependency is `rusticnotion = { path = "../rusticnotion" }`. This app requires the library patches in that checkout; copying this repository alone is insufficient.
+Configure GitHub SSH access before building. `Cargo.lock` pins the resolved Git commit; use `cargo update -p rusticnotion` to adopt a newer revision.
 
 Create a Notion integration with read, insert, and update content permissions. Share the pages you want to access with the integration, then set its token in your shell:
 
@@ -101,9 +99,9 @@ Editing replaces a block's rich text with plain text. Styled text and links requ
 
 Before updating a block, the app retrieves its current modification timestamp and rejects a conflicting edit. This is a best-effort check: Notion does not provide an atomic compare-and-update operation, so a change between the check and the save can still race. Failed saves retain the draft and show the error. There are no automatic write retries. If a response is lost, inspect Notion before retrying an append or page creation; the first request may have succeeded. Rate-limit errors show the requested waiting time.
 
-Drafts and navigation state live in memory. Quitting discards them. During a save, wait for the response before quitting. The app uses one API token or one saved OAuth workspace authorization and excludes database property editing, deletion, reordering, offline sync, and whole-page Markdown editing. Both clients use API version `2022-06-28`; modern multi-source database workflows are outside this version's scope.
+Drafts and navigation state live in memory. Quitting discards them. During a save, wait for the response before quitting. The app uses one API token or one saved OAuth workspace authorization and excludes database property editing, deletion, reordering, offline sync, and whole-page Markdown editing. Both clients use API version `2026-03-11` from rusticnotion's `NOTION_API_VERSION` constant. Insertions use `position.after_block` to retain their selected sibling anchor.
 
-## Structure and library patches
+## Structure and dependency
 
 - `src/app.rs`: navigation, modal state, asynchronous results, and stale-read rejection.
 - `src/editor.rs`: text buffer, draft validation, and write intent.
@@ -113,22 +111,18 @@ Drafts and navigation state live in memory. Quitting discards them. During a sav
 - `src/rich_text.rs` and `src/hyperlinks.rs`: styled spans, Unicode wrapping, and OSC 8 output kept separate from Ratatui cell symbols.
 - `src/ui.rs`: responsive ratatui rendering.
 
-The sibling rusticnotion patches update the API header, default omitted child arrays, encode opaque cursors, add paginated page searches and shallow block reads, expose a test/proxy endpoint, and report rate-limit waiting times. They also fix an existing recursive-helper compile error and propagate child-read failures. Table rows now decode arrays of rich-text arrays, and page/database mentions decode ID references. The corrected table-cell and mention field types affect callers constructing those models directly; child collection field types remain unchanged.
+The Git dependency supplies the Notion API models, paginated search and child reads, shallow block retrieval, page creation, and rate-limit errors. The TUI accepts pages with data-source parents and uses the current `in_trash` response fields. The reqwest adapter shares the library's API version for block writes.
 
 ## Checks
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked
 python3 tests/terminal_smoke.py
 python3 tests/auth_smoke.py
 python3 tests/rich_text_smoke.py
-
-cargo fmt --manifest-path ../rusticnotion/Cargo.toml --check
-CARGO_HUSKY_DONT_INSTALL_HOOKS=1 cargo test --manifest-path ../rusticnotion/Cargo.toml --lib
-CARGO_HUSKY_DONT_INSTALL_HOOKS=1 cargo clippy --manifest-path ../rusticnotion/Cargo.toml --lib
 ```
 
-Unit and HTTP mock tests need no credentials; mocks bind local ports. The terminal smoke tests use Linux pseudo-terminals to exercise search, nested navigation, draft recovery, resizing, terminal restoration, interactive authentication, OAuth cancellation/denial, text styles, and hyperlinks. The authentication smoke test disables desktop launchers; the rich-text smoke test uses a fake browser to verify URL dispatch. Neither contacts Notion. rusticnotion's existing integration tests contact Notion and require credentials; the `--lib` command intentionally runs only credential-free library tests.
+Unit and HTTP mock tests need no credentials; mocks bind local ports. The terminal smoke tests use Linux pseudo-terminals to exercise search, nested navigation, draft recovery, resizing, terminal restoration, interactive authentication, OAuth cancellation/denial, text styles, and hyperlinks. The authentication smoke test disables desktop launchers; the rich-text smoke test uses a fake browser to verify URL dispatch. Neither contacts Notion. The library's own tests are maintained in the rusticnotion repository.

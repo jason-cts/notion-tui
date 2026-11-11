@@ -225,7 +225,7 @@ impl NotionService for ApiService {
                 .api
                 .search(SearchRequest::pages(query).start_from(cursor))
                 .await
-                .context("Search failed; check token permissions and shared pages")?;
+                .context("Search failed")?;
             for item in response.results {
                 if let Object::Page { page } = item {
                     pages.push(page_item(page));

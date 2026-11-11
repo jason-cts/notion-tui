@@ -297,8 +297,7 @@ pub fn append_payload(kind: Kind, text: &str, after: Option<&str>) -> Value {
     let mut payload =
         json!({"children": [{"object": "block", "type": kind.name(), kind.name(): fields}]});
     if let Some(after) = after {
-        // Keep the insertion anchor explicit for the pinned 2022-06-28 API.
-        payload["after"] = json!(after);
+        payload["position"] = json!({"type":"after_block","after_block":{"id":after}});
     }
     payload
 }

@@ -17,7 +17,7 @@ thiserror = "1"
 libc = "0.2"
 ratatui = "0.30"
 reqwest = { version = "0.11", features = ["json"] }
-rusticnotion = { path = "../rusticnotion" }
+rusticnotion = { git = "ssh://git@github.com/jason-cts/rusticnotion.git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }

@@ -6,7 +6,7 @@ use wiremock::{
 
 fn page(id: &str, title: &str) -> Value {
     json!({"object":"page","id":id,"created_time":"2026-01-01T00:00:00Z",
-        "last_edited_time":"2026-01-01T00:00:00Z","archived":false,"icon":null,
+        "last_edited_time":"2026-01-01T00:00:00Z","in_trash":false,"icon":null,
         "parent":{"type":"workspace","workspace":true},
         "properties":{"title":{"id":"title","type":"title","title":[
             {"type":"text","plain_text":title,"text":{"content":title}}]}}})
@@ -15,7 +15,7 @@ fn page(id: &str, title: &str) -> Value {
 fn block(modified: &str) -> Value {
     json!({"object":"block","id":"block","created_time":"2026-01-01T00:00:00Z",
         "last_edited_time":modified,"created_by":{"id":"user"},"last_edited_by":{"id":"user"},
-        "has_children":true,"type":"paragraph","paragraph":{"rich_text":[],"color":"default"}})
+        "has_children":true,"in_trash":false,"type":"paragraph","paragraph":{"rich_text":[],"color":"default"}})
 }
 
 fn list(results: Value, cursor: Option<&str>) -> Value {
@@ -23,10 +23,104 @@ fn list(results: Value, cursor: Option<&str>) -> Value {
 }
 
 #[tokio::test]
-async fn search_and_blocks_follow_all_pages_with_opaque_cursors() {
+async fn file_blocks_with_nested_captions_do_not_prevent_loading_page_contents() {
     let server = MockServer::start().await;
+    let attachments: Vec<_> = [
+        json!({"type":"file", "file":{"url":"https://example.com/internal.txt", "expiry_time":"2026-11-11T00:00:00Z"},
+            "caption":[], "name":"internal.txt"}),
+        json!({"type":"external", "external":{"url":"https://example.com/external.txt"},
+            "caption":[{"type":"text","plain_text":"A caption","text":{"content":"A caption"}}], "name":"external.txt"}),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, file)| {
+        let mut value = block("2026-01-01T00:00:00Z");
+        value.as_object_mut().unwrap().remove("paragraph");
+        value["id"] = json!(format!("attachment-{index}"));
+        value["type"] = json!("file");
+        value["has_children"] = json!(false);
+        value["file"] = file;
+        value
+    })
+    .collect();
+    Mock::given(method("GET"))
+        .and(path("/blocks/page/children"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(list(json!(attachments), None)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+    let blocks = api.children("page").await.unwrap();
+    assert_eq!(blocks.len(), 2);
+    for (index, block) in blocks.iter().enumerate() {
+        assert_eq!(block.id, format!("attachment-{index}"));
+        assert_eq!(block.block_type, "file");
+        assert!(!block.children);
+    }
+}
+
+#[tokio::test]
+async fn pages_with_block_parents_are_searchable_and_openable() {
+    let server = MockServer::start().await;
+    let mut nested = page("nested-page", "Page inside a toggle");
+    nested["parent"] = json!({"type":"block_id","block_id":"toggle-block"});
+    nested["properties"]["Verification"] = json!({
+        "id":"verification", "type":"verification",
+        "verification":{"state":"unverified","verified_by":null,"date":null}
+    });
     Mock::given(method("POST"))
         .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(list(
+            json!([page("root", "Root page"), nested.clone()]),
+            None,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pages/nested-page"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nested))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+    let pages = api.search("").await.unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[1].id, "nested-page");
+    assert_eq!(pages[1].title, "Page inside a toggle");
+    assert_eq!(api.page("nested-page").await.unwrap(), pages[1]);
+}
+
+#[tokio::test]
+async fn search_decode_errors_do_not_suggest_changing_token_permissions() {
+    let server = MockServer::start().await;
+    let mut malformed = page("page", "Page");
+    malformed["parent"] = json!({"type":"block_id"});
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(list(json!([malformed]), None)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+    let error = api.search("").await.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.starts_with("Search failed:"), "{message}");
+    assert!(message.contains("Error parsing json response"), "{message}");
+    assert!(!message.contains("token permissions"), "{message}");
+    assert!(!crate::auth::is_unauthorized(&error));
+}
+
+#[tokio::test]
+async fn search_and_blocks_follow_all_pages_with_opaque_cursors() {
+    let server = MockServer::start().await;
+    let mut data_source_page = page("2", "Notes 二");
+    data_source_page["parent"] = json!({
+        "type":"data_source_id", "data_source_id":"source", "database_id":"database"
+    });
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .and(header("Notion-Version", "2026-03-11"))
         .and(body_json(
             json!({"query":"Notes","filter":{"property":"object","value":"page"}}),
         ))
@@ -41,13 +135,14 @@ async fn search_and_blocks_follow_all_pages_with_opaque_cursors() {
         .and(path("/search"))
         .and(body_partial_json(json!({"start_cursor":"a&b+c"})))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(list(json!([page("2", "Notes 二")]), None)),
+            ResponseTemplate::new(200).set_body_json(list(json!([data_source_page]), None)),
         )
         .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/blocks/page/children"))
+        .and(header("Notion-Version", "2026-03-11"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(list(json!([block("2026-01-01T00:00:00Z")]), Some("a&b+c"))),
@@ -109,7 +204,7 @@ async fn update_checks_version_and_sends_minimal_patch() {
         .await;
     Mock::given(method("PATCH"))
         .and(path("/blocks/block"))
-        .and(header("Notion-Version", "2022-06-28"))
+        .and(header("Notion-Version", "2026-03-11"))
         .and(header("Authorization", "Bearer test"))
         .and(body_json(
             json!({"paragraph":{"rich_text":[{"type":"text","text":{"content":"new"}}]}}),
@@ -174,8 +269,8 @@ async fn insertion_uses_selected_anchor_and_focuses_the_new_sibling_after_refres
         };
         Mock::given(method("PATCH"))
             .and(path(format!("/blocks/{parent}/children")))
-            .and(header("Notion-Version", "2022-06-28"))
-            .and(body_json(json!({"after":"middle", "children":[{
+            .and(header("Notion-Version", "2026-03-11"))
+            .and(body_json(json!({"position":{"type":"after_block","after_block":{"id":"middle"}}, "children":[{
                 "object":"block", "type":"paragraph", "paragraph":{"rich_text":[
                     {"type":"text","text":{"content":"new sibling"}}
                 ]}

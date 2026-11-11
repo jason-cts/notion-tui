@@ -2044,7 +2044,8 @@ dependencies = [
 
 [[package]]
 name = "rusticnotion"
-version = "0.5.3"
+version = "0.7.0"
+source = "git+ssh://git@github.com/jason-cts/rusticnotion.git#622d36e09c11229b1c12535b699eed9316fa1688"
 dependencies = [
  "chrono",
  "reqwest",
