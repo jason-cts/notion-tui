@@ -53,6 +53,25 @@ try:
     wait_for("Nested content")
     send("\x7f")
     wait_for("Your workspace, at your fingertips")
+    send("d")
+    wait_for("DELETE BLOCK")
+    send("\r")
+    # Enter leaves the modal open; n cancels instead of creating a child page.
+    send("n")
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 111, 0, 0))
+    os.kill(process.pid, __import__("signal").SIGWINCH)
+    wait_for("CONTENT")
+    send("d")
+    wait_for("Move to Trash?")
+    send("\x1b")
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 110, 0, 0))
+    os.kill(process.pid, __import__("signal").SIGWINCH)
+    wait_for("CONTENT")
+    send("d")
+    wait_for("DELETE BLOCK")
+    send("y")
+    # Ratatui retains the shared "De" cells when Deleting becomes Demo.
+    wait_for("to delete blocks")
     send("n")
     wait_for("NEW CHILD PAGE")
     # Exercise both DEL and BS through crossterm, including a multibyte glyph.
@@ -88,7 +107,7 @@ try:
         transcript.extend(os.read(master, 65536))
     assert b"\x1b[?1049l" in transcript, "Alternate screen was not restored"
     assert b"\x1b[?2004l" in transcript, "Bracketed paste was not disabled"
-    print("PASS: search, nested navigation, both Backspace encodings, failed-save draft, narrow layout, full-block reader, terminal restoration")
+    print("PASS: search, nested navigation, deletion confirmation/cancel/read-only failure, both Backspace encodings, failed-save draft, narrow layout, full-block reader, terminal restoration")
 finally:
     if process.poll() is None:
         process.kill()

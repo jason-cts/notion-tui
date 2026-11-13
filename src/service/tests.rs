@@ -18,6 +18,333 @@ fn block(modified: &str) -> Value {
         "has_children":true,"in_trash":false,"type":"paragraph","paragraph":{"rich_text":[],"color":"default"}})
 }
 
+fn table_row() -> Value {
+    let mut value = block("2026-01-01T00:00:00Z");
+    value.as_object_mut().unwrap().remove("paragraph");
+    value["type"] = json!("table_row");
+    value["has_children"] = json!(false);
+    value["table_row"] = json!({"cells":[
+        [{"type":"text","plain_text":"first │ cell\n你好","text":{"content":"first │ cell\n你好"}}],
+        [{"type":"text","plain_text":"Link","href":"https://example.com/","text":{"content":"Link","link":{"url":"https://example.com/"}},"annotations":{"bold":true,"color":"blue"}}],
+        []
+    ]});
+    value
+}
+
+#[tokio::test]
+async fn deletion_checks_fresh_blocks_and_sends_a_bodyless_authenticated_delete() {
+    for block_type in [
+        "paragraph",
+        "child_page",
+        "child_database",
+        "table_row",
+        "divider",
+    ] {
+        let server = MockServer::start().await;
+        let mut value = if block_type == "table_row" {
+            table_row()
+        } else {
+            block("2026-01-01T00:00:00Z")
+        };
+        if block_type != "table_row" && block_type != "paragraph" {
+            value.as_object_mut().unwrap().remove("paragraph");
+            value["type"] = json!(block_type);
+            value[block_type] = if block_type.starts_with("child_") {
+                json!({"title":"Child"})
+            } else {
+                json!({})
+            };
+        }
+        Mock::given(method("GET"))
+            .and(path("/blocks/block"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(value.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/blocks/block"))
+            .and(header("Notion-Version", "2026-03-11"))
+            .and(header("Authorization", "Bearer test"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object":"block","id":"block"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        assert!(
+            api.write(Write::Delete {
+                original: BlockItem::from_value(&value)
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "{block_type}");
+        assert_eq!(requests[0].method.to_string(), "GET");
+        assert_eq!(requests[1].method.to_string(), "DELETE");
+        assert!(requests[1].body.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn deletion_rejects_missing_identifiers_and_remote_conflicts_without_deleting() {
+    for change in [
+        "missing_id",
+        "missing_timestamp",
+        "timestamp",
+        "type",
+        "read_failure",
+    ] {
+        let server = MockServer::start().await;
+        let mut original = BlockItem::from_value(&block("2026-01-01T00:00:00Z"));
+        let mut fresh = block("2026-01-01T00:00:00Z");
+        match change {
+            "missing_id" => original.id.clear(),
+            "missing_timestamp" => original.modified.clear(),
+            "timestamp" => fresh["last_edited_time"] = json!("2026-02-01T00:00:00Z"),
+            "type" => {
+                fresh.as_object_mut().unwrap().remove("paragraph");
+                fresh["type"] = json!("divider");
+                fresh["divider"] = json!({});
+            }
+            _ => {}
+        }
+        let missing = change.starts_with("missing_");
+        Mock::given(method("GET"))
+            .and(path("/blocks/block"))
+            .respond_with(if change == "read_failure" {
+                ResponseTemplate::new(403).set_body_json(json!({"message":"No access"}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(fresh)
+            })
+            .expect(if missing { 0 } else { 1 })
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        let error = api.write(Write::Delete { original }).await.unwrap_err();
+        if matches!(change, "type" | "timestamp") {
+            assert!(error.to_string().contains("Conflict"));
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.to_string() == "GET")
+        );
+        assert_eq!(requests.len(), usize::from(!missing));
+    }
+}
+
+#[tokio::test]
+async fn deletion_failures_are_reported_without_replaying_the_request() {
+    for failure in ["401", "403", "404", "429", "500", "unreadable", "timeout"] {
+        let server = MockServer::start().await;
+        let value = block("2026-01-01T00:00:00Z");
+        Mock::given(method("GET"))
+            .and(path("/blocks/block"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(value.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = match failure {
+            "unreadable" => ResponseTemplate::new(200).set_body_string("not JSON"),
+            "timeout" => ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(Duration::from_secs(1)),
+            status => ResponseTemplate::new(status.parse::<u16>().unwrap())
+                .insert_header("Retry-After", "12")
+                .set_body_json(json!({"message":"delete failed"})),
+        };
+        Mock::given(method("DELETE"))
+            .and(path("/blocks/block"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        if failure == "timeout" {
+            api.http = Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap();
+        }
+        let error = api
+            .write(Write::Delete {
+                original: BlockItem::from_value(&value),
+            })
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        match failure {
+            "401" => assert!(is_unauthorized(&error)),
+            "429" => assert!(message.contains("12 seconds before deleting again")),
+            "unreadable" | "timeout" => assert!(message.contains("inspect Notion before retrying")),
+            _ => assert!(message.contains("delete failed")),
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "{failure}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn table_row_reads_and_updates_all_cells_preserving_unchanged_rich_text() {
+    let server = MockServer::start().await;
+    let value = table_row();
+    Mock::given(method("GET"))
+        .and(path("/blocks/page/children"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(list(json!([value.clone()]), None)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/block"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(value.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH")).and(path("/blocks/block"))
+        .and(header("Notion-Version", "2026-03-11"))
+        .and(header("Authorization", "Bearer test"))
+        .and(body_json(json!({"table_row":{"cells":[
+            [{"type":"text","text":{"content":"changed\n🦀 │ cell"}}],
+            [{"type":"text","text":{"content":"Link","link":{"url":"https://example.com/"}},"annotations":{"bold":true,"color":"blue"}}],
+            []
+        ]}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(value))
+        .expect(1).mount(&server).await;
+    let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+    let original = api.children("page").await.unwrap().remove(0);
+    assert!(original.editable_table_row());
+    assert_eq!(
+        original.table_cells.as_ref().unwrap()[0].text,
+        "first │ cell\n你好"
+    );
+    api.write(Write::UpdateTableRow {
+        original,
+        cells: vec!["changed\n🦀 │ cell".into(), "Link".into(), "".into()],
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn changed_table_row_timestamp_type_or_cell_count_prevents_patch() {
+    for change in ["timestamp", "type", "count"] {
+        let server = MockServer::start().await;
+        let original = BlockItem::from_value(&table_row());
+        let mut fresh = table_row();
+        match change {
+            "timestamp" => fresh["last_edited_time"] = json!("2026-02-01T00:00:00Z"),
+            "type" => fresh = block("2026-01-01T00:00:00Z"),
+            _ => {
+                fresh["table_row"]["cells"].as_array_mut().unwrap().pop();
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path("/blocks/block"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fresh))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        let error = api
+            .write(Write::UpdateTableRow {
+                original,
+                cells: vec!["draft".into(), "Link".into(), "".into()],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Conflict"), "{change}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_table_row_drafts_are_rejected_before_network_access() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+    for (mut original, cells) in [
+        (
+            BlockItem::from_value(&table_row()),
+            vec!["wrong count".into()],
+        ),
+        (
+            BlockItem::from_value(&table_row()),
+            vec!["x".repeat(100_001), "".into(), "".into()],
+        ),
+        (
+            BlockItem::from_value(&table_row()),
+            vec!["protected".into(), "".into(), "".into()],
+        ),
+    ] {
+        if cells[0] == "protected" {
+            original.protected = true;
+        }
+        assert!(
+            api.write(Write::UpdateTableRow { original, cells })
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn table_row_failed_writes_are_not_replayed() {
+    for status in [401, 429, 500] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/blocks/block"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(table_row()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/blocks/block"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Retry-After", "12")
+                    .set_body_json(json!({"message":"save failed"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        let error = api
+            .write(Write::UpdateTableRow {
+                original: BlockItem::from_value(&table_row()),
+                cells: vec!["draft".into(), "Link".into(), "".into()],
+            })
+            .await
+            .unwrap_err();
+        if status == 401 {
+            assert!(is_unauthorized(&error));
+        }
+        if status == 429 {
+            assert!(error.to_string().contains("12 seconds"));
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
 fn list(results: Value, cursor: Option<&str>) -> Value {
     json!({"object":"list","results":results,"has_more":cursor.is_some(),"next_cursor":cursor})
 }

@@ -47,7 +47,7 @@ Fetch rusticnotion directly from `git@github.com:jason-cts/rusticnotion.git`, us
 - Verify rendering at normal and narrow widths, including Unicode.
 - Mock OAuth code exchange, state validation, denial, timeout, cancellation, saved-login reuse, refresh rotation, concurrent sessions, token precedence, logout, private storage, and expired saves retaining drafts.
 - Run formatting checks, Clippy, and credential-free tests against the locked Git dependency. Keep the library's own test suite in its repository. Run existing live integration tests only when credentials are available.
-- Keep one connection and one saved OAuth workspace. Exclude database property workflows, deletion, reordering, offline sync, and whole-page Markdown editing.
+- Keep one connection and one saved OAuth workspace. Exclude database property workflows, database-record deletion, reordering, offline sync, and whole-page Markdown editing.
 
 ## Child Database Views
 
@@ -59,3 +59,19 @@ Fetch rusticnotion directly from `git@github.com:jason-cts/rusticnotion.git`, us
 - Support every documented grouping family, including formula result grouping and multi-valued membership. Use local dates, configured week starts, half-open numeric buckets, schema/first-seen manual order, and an explicit No value group. Preserve query order within groups. Display notices for API presentation gaps and unsupported future grouping/layouts.
 - Keep database screens read-only; open a row page to use existing content editing. Document keyboard behavior and add demo content plus database PTY coverage alongside existing smoke tests.
 - Validate library HTTP contracts, TUI service pagination/expiry/cleanup, all grouping families, subgroups/empty groups, stale loads, view switching, page navigation, styles/links, narrow rendering, and terminal restoration. Run formatting, Clippy, builds, and credential-free tests in both repositories.
+
+## Simple Table Row Editing
+
+- Retain cell boundaries and original writable rich-text inputs alongside the flattened row display. Do not split display text on `│`.
+- Press `e` on an eligible `table_row` to open a row dialog with multiline Cell 1…N fields. Tab/Shift-Tab cycle cells, Enter inserts a newline, Ctrl-S saves the whole row, and Esc confirms discarding all drafts. Keep the active field visible, including on small terminals.
+- Preserve unchanged cells' runs, styles, colors, and links; convert only edited cells to plain text. Confirm formatting loss only for changed styled cells, and invalidate confirmation after further text edits. Keep rows containing mentions, equations, or unrecognized content read-only.
+- Use `Write::UpdateTableRow { original, cells }` and PATCH the complete cells array using writable fields only. Reject a changed timestamp, block type, or cell count before PATCH. Retain the existing best-effort conflict-check semantics and never replay a write automatically.
+- Apply the 100,000-character block limit and 2,000-character run splitting. Preserve empty cells. Close unchanged drafts without a request. Preserve every draft/cursor and the active cell after errors; refresh and restore the selected row by ID after success.
+- Cover model/payload preservation, keyboard handling, modal confirmation, conflict rejection, HTTP failures, small-terminal rendering, and PTY interaction with credential-free tests. Add a demo table and document the keys and limitations. No rusticnotion changes are required; exclude database-property editing, row/column creation, and column removal. Row removal is covered by block deletion below.
+
+## Block Deletion
+
+- Press `d` in a loaded content-block list to confirm deletion of any selected block, including child pages, child databases, table rows, and containers. Show its type and a shortened text/title preview; warn when contents are included. Only `y`/`Y` confirms; `n`/`N`/Esc cancels. Keep database records and search results read-only.
+- Capture the block and parent before confirmation. Check its timestamp and type before `DELETE /blocks/{id}`, using the shared authenticated adapter and API version. Move to Notion Trash without recursive delete requests. Never replay writes automatically, including after OAuth refresh.
+- Keep list and selection after failure. Refresh the parent and page search after success; select the next block or the previous last item. Invalidate deleted database metadata and stale responses. Demo remains read-only; restore through Notion.
+- Test modal isolation, cancellation, conflicts, HTTP/OAuth failures, selection recovery, database cache invalidation, responsive rendering, and terminal interaction without Notion credentials.

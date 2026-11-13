@@ -1,6 +1,6 @@
 use crate::{
     app::{App, Confirm, Focus},
-    editor::{Buffer, Target},
+    editor::{Buffer, Editor, Target},
     hyperlinks::{self, Links},
     model::BlockLabel,
     rich_text::{self, RichLine, RichRun},
@@ -111,6 +111,17 @@ impl Ui {
             area,
         );
         if area.width < 16 || area.height < 7 {
+            if app.confirm == Some(Confirm::Delete) {
+                render_confirmation(frame, app);
+                return;
+            }
+            if let Some(editor) = &app.editor
+                && editor.row.is_some()
+            {
+                render_row_editor(frame, editor, app.saving, app.confirm.is_none());
+                render_confirmation(frame, app);
+                return;
+            }
             frame.render_widget(
                 Paragraph::new("Resize terminal\nq to quit").style(Style::default().fg(ACCENT)),
                 area,
@@ -168,7 +179,11 @@ impl Ui {
             }
         }
         let busy = if app.saving {
-            "Saving…"
+            if app.pending_delete.is_some() {
+                "Deleting…"
+            } else {
+                "Saving…"
+            }
         } else if app.loading_content || app.loading_search {
             "Loading…"
         } else {
@@ -186,7 +201,7 @@ impl Ui {
         frame.render_widget(
             Paragraph::new(
                 if app.database().is_some() { "[ / ] views  h/l columns  Enter page  ←/Backspace parent  v details  o link  r refresh  q quit" }
-                else { "Tab panes  / search  Enter open  o link  v read  e edit  a append  ? help  q quit" },
+                else { "Tab panes  / search  Enter open  o link  v read  e edit  d delete  a append  ? help  q quit" },
             )
             .style(Style::default().fg(ACCENT)),
             Rect {
@@ -279,73 +294,65 @@ impl Ui {
             );
         }
         if let Some(editor) = &app.editor {
-            let area = popup(area, 100, frame.area().height.saturating_sub(4).min(30));
-            frame.render_widget(Clear, area);
-            let name = match &editor.target {
-                Target::Edit(_) => "EDIT BLOCK",
-                Target::Append { after: Some(_), .. } => "APPEND BLOCK · after selected block",
-                Target::Append { after: None, .. } => "APPEND BLOCK · first block",
-                Target::Create(_) => "NEW CHILD PAGE",
-            };
-            frame.render_widget(
-                panel(format!("{name} · {}", editor.kind.name()), true),
-                area,
-            );
-            let parts = Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(if editor.error.is_some() { 4 } else { 1 }),
-                Constraint::Length(1),
-            ])
-            .split(area.inner(ratatui::layout::Margin {
-                horizontal: 2,
-                vertical: 1,
-            }));
-            render_buffer(
-                frame,
-                &editor.buffer,
-                parts[0],
-                !app.saving && app.confirm.is_none(),
-            );
-            let hint = editor
-                .error
-                .as_deref()
-                .unwrap_or("Ctrl-S save · Esc cancel · Tab changes appended block type");
-            frame.render_widget(
-                Paragraph::new(clean(hint))
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(if editor.error.is_some() { ERROR } else { MUTED })),
-                parts[1],
-            );
-            frame.render_widget(
-                Paragraph::new(if app.saving {
-                    "Saving… please wait".into()
-                } else {
-                    format!(
-                        "{} characters · Ctrl-S save",
-                        editor.buffer.text.chars().count()
-                    )
-                })
-                .style(Style::default().fg(ACCENT)),
-                parts[2],
-            );
+            if editor.row.is_some() {
+                render_row_editor(frame, editor, app.saving, app.confirm.is_none());
+            } else {
+                let area = popup(area, 100, frame.area().height.saturating_sub(4).min(30));
+                frame.render_widget(Clear, area);
+                let name = match &editor.target {
+                    Target::Edit(_) => "EDIT BLOCK",
+                    Target::Append { after: Some(_), .. } => "APPEND BLOCK · after selected block",
+                    Target::Append { after: None, .. } => "APPEND BLOCK · first block",
+                    Target::Create(_) => "NEW CHILD PAGE",
+                };
+                frame.render_widget(
+                    panel(format!("{name} · {}", editor.kind.name()), true),
+                    area,
+                );
+                let parts = Layout::vertical([
+                    Constraint::Min(1),
+                    Constraint::Length(if editor.error.is_some() { 4 } else { 1 }),
+                    Constraint::Length(1),
+                ])
+                .split(area.inner(ratatui::layout::Margin {
+                    horizontal: 2,
+                    vertical: 1,
+                }));
+                render_buffer(
+                    frame,
+                    &editor.buffer,
+                    parts[0],
+                    !app.saving && app.confirm.is_none(),
+                );
+                let hint = editor
+                    .error
+                    .as_deref()
+                    .unwrap_or("Ctrl-S save · Esc cancel · Tab changes appended block type");
+                frame.render_widget(
+                    Paragraph::new(clean(hint))
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(if editor.error.is_some() {
+                            ERROR
+                        } else {
+                            MUTED
+                        })),
+                    parts[1],
+                );
+                frame.render_widget(
+                    Paragraph::new(if app.saving {
+                        "Saving… please wait".into()
+                    } else {
+                        format!(
+                            "{} characters · Ctrl-S save",
+                            editor.buffer.text.chars().count()
+                        )
+                    })
+                    .style(Style::default().fg(ACCENT)),
+                    parts[2],
+                );
+            }
         }
-        if let Some(confirm) = app.confirm {
-            let area = popup(area, 68, 8);
-            frame.render_widget(Clear, area);
-            let text = match confirm {
-                Confirm::Formatting => {
-                    "Saving replaces styled text and links with plain text.\nBlock color and child blocks are preserved.\n\nContinue? y / n"
-                }
-                Confirm::Discard => "Discard this draft?\n\ny discard · n keep editing",
-                Confirm::Quit => "Quit and discard this draft?\n\ny quit · n keep editing",
-            };
-            frame.render_widget(
-                Paragraph::new(text)
-                    .block(panel("CONFIRM".into(), true))
-                    .wrap(Wrap { trim: false }),
-                area,
-            );
-        }
+        render_confirmation(frame, app);
     }
 
     fn pages(&mut self, frame: &mut Frame, app: &App, area: Rect) {
@@ -481,15 +488,18 @@ impl Ui {
             "  o             Open selected block's link in your browser\n",
             "  q / Ctrl-C    Quit                 ?        Help\n\n",
             "  EDIT\n",
-            "  e             Edit selected text block\n",
+            "  e             Edit selected text block or table row\n",
+            "  d             Delete selected block (confirm with y)\n",
             "  Space         Toggle selected to-do\n",
             "  a             Insert a block after the selected block\n",
             "  n             Create a child of the current page\n",
             "  Ctrl-S        Save draft            Esc      Cancel draft\n",
             "  Tab           Choose appended block type\n",
+            "  Tab/Shift-Tab Move between table-row cells\n",
             "  Arrows/Home/End move the text cursor; Enter inserts a newline.\n\n",
             "  Styled text requires confirmation before replacement.\n",
-            "  Mentions, equations, and unsupported types are read-only.\n",
+            "  Mentions, equations, and unsupported types cannot be edited.\n",
+            "  Deleting a container includes its contents; restore in Notion Trash.\n",
             "  A failed save keeps your draft. Check Notion before retrying.\n\n",
             "  ↑/↓ or j/k scroll · PageUp/PageDown move ten lines\n",
             "  Any other key closes help."
@@ -501,6 +511,192 @@ impl Ui {
                 .scroll((scroll, 0)),
             area,
         );
+    }
+}
+
+fn render_confirmation(frame: &mut Frame, app: &App) {
+    if let Some(confirm) = app.confirm {
+        let text = match confirm {
+            Confirm::Delete => {
+                render_delete_confirmation(frame, app);
+                return;
+            }
+            Confirm::Formatting
+                if app
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.row.is_some()) =>
+            {
+                "Changed cells will use plain text, replacing their styles and links.\nUnchanged cells keep their formatting.\n\nContinue? y / n"
+            }
+            Confirm::Formatting => {
+                "Saving replaces styled text and links with plain text.\nBlock color and child blocks are preserved.\n\nContinue? y / n"
+            }
+            Confirm::Discard => "Discard this draft?\n\ny discard · n keep editing",
+            Confirm::Quit => "Quit and discard this draft?\n\ny quit · n keep editing",
+        };
+        let area = popup(frame.area(), 68, 8);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(panel("CONFIRM".into(), true))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+}
+
+fn render_delete_confirmation(frame: &mut Frame, app: &App) {
+    let Some(target) = &app.pending_delete else {
+        return;
+    };
+    let block = &target.block;
+    let includes_contents =
+        block.children || block.child_page || block.block_type == "child_database";
+    let area = popup(frame.area(), 68, 12);
+    frame.render_widget(Clear, area);
+    let border = panel("DELETE BLOCK".into(), true);
+    let inner = border.inner(area);
+    frame.render_widget(border, area);
+    let controls = wrapped(
+        if inner.width < 26 {
+            "y delete\nn/Esc cancel"
+        } else {
+            "y delete · n/Esc cancel"
+        },
+        inner.width,
+    );
+    let body_height = inner.height.saturating_sub(controls.len() as u16);
+    let mut lines = wrapped("Move to Trash?", inner.width);
+    if includes_contents {
+        lines.extend(wrapped("Includes contents.", inner.width));
+    }
+    lines.extend(wrapped(&format!("Type: {}", block.block_type), inner.width));
+    let preview: String = clean(&block.text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect();
+    let preview = if preview.is_empty() {
+        "(empty)"
+    } else {
+        &preview
+    };
+    lines.extend(wrapped(preview, inner.width).into_iter().take(2));
+    lines.truncate(usize::from(body_height));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            height: body_height,
+            ..inner
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(controls).style(Style::default().fg(ERROR)),
+        Rect {
+            y: inner.y + body_height,
+            height: inner.height - body_height,
+            ..inner
+        },
+    );
+}
+
+fn render_row_editor(frame: &mut Frame, editor: &Editor, saving: bool, cursor: bool) {
+    let row = editor.row.as_ref().unwrap();
+    let screen = frame.area();
+    let area = if screen.height < 10 {
+        screen
+    } else {
+        popup(screen, 100, screen.height.saturating_sub(2).min(30))
+    };
+    frame.render_widget(Clear, area);
+    let inner = if area.height >= 6 && area.width >= 8 {
+        let block = panel(
+            format!(
+                "EDIT TABLE ROW · Cell {}/{}",
+                row.active + 1,
+                row.cells.len()
+            ),
+            true,
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
+    let fields = if inner.height >= 5 {
+        let parts = Layout::vertical([
+            Constraint::Min(2),
+            Constraint::Length(if editor.error.is_some() { 2 } else { 1 }),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        frame.render_widget(
+            Paragraph::new(clean(editor.error.as_deref().unwrap_or(
+                "Tab/Shift-Tab cells · Enter newline · Ctrl-S save · Esc cancel",
+            )))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(if editor.error.is_some() { ERROR } else { MUTED })),
+            parts[1],
+        );
+        frame.render_widget(
+            Paragraph::new(if saving {
+                "Saving… please wait".into()
+            } else {
+                format!(
+                    "Cell {}/{} · {} characters · Ctrl-S save",
+                    row.active + 1,
+                    row.cells.len(),
+                    editor.character_count()
+                )
+            })
+            .style(Style::default().fg(ACCENT)),
+            parts[2],
+        );
+        parts[0]
+    } else {
+        inner
+    };
+    if fields.height == 0 || fields.width == 0 {
+        return;
+    }
+    // Each visible field gets a label and at least one text line. Keep the active
+    // field on screen without allocating space for every column in a wide table.
+    let count = (usize::from(fields.height) / 4).max(1).min(row.cells.len());
+    let start = row.active.saturating_sub(count - 1);
+    let areas = Layout::vertical(vec![Constraint::Fill(1); count]).split(fields);
+    for (offset, &area) in areas.iter().enumerate() {
+        let index = start + offset;
+        let active = index == row.active;
+        let text_area = if area.height >= 2 {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{}Cell {}",
+                    if active { "› " } else { "  " },
+                    index + 1
+                ))
+                .style(Style::default().fg(if active { ACCENT } else { MUTED })),
+                Rect { height: 1, ..area },
+            );
+            Rect {
+                y: area.y + 1,
+                height: area.height - 1,
+                ..area
+            }
+        } else {
+            area
+        };
+        if active {
+            render_buffer(frame, &row.cells[index], text_area, cursor && !saving);
+        } else {
+            frame.render_widget(
+                Paragraph::new(row.cells[index].text.as_str()).style(Style::default().fg(MUTED)),
+                text_area,
+            );
+        }
     }
 }
 
@@ -533,6 +729,56 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn row_dialog_scrolls_active_cell_into_view_and_survives_tiny_terminals() {
+        for (width, height) in [(120, 35), (45, 20), (16, 7), (10, 4), (1, 1)] {
+            let (tx, _) = mpsc::unbounded_channel();
+            let mut app = App::new(Arc::new(DemoService), tx, true);
+            let mut row = crate::model::tests::table_row();
+            let cell = row.table_cells.as_ref().unwrap()[0].clone();
+            row.table_cells = Some(vec![cell; 20]);
+            app.editor = Some(Editor::new(Target::Edit(row)));
+            let editor = app.editor.as_mut().unwrap();
+            for _ in 0..19 {
+                editor.key(crossterm::event::KeyCode::Tab.into());
+            }
+            editor.insert(&format!("\n{}TAIL", "line\n".repeat(100)));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut ui = Ui::default();
+            terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+            let contents: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            if width >= 10 {
+                assert!(contents.contains("TAIL"), "{width}x{height}: {contents}");
+            }
+            if width >= 45 {
+                assert!(contents.contains("Cell 20"), "{contents}");
+            }
+            let position = terminal.get_cursor_position().unwrap();
+            assert!(position.x < width && position.y < height);
+            assert!(ui.links.is_empty());
+            app.editor.as_mut().unwrap().error =
+                Some("Conflict: row changed; draft retained".into());
+            terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+            if width >= 45 {
+                let contents: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(contents.contains("Conflict"));
+                assert!(contents.contains("TAIL"));
+            }
+        }
+    }
 
     #[test]
     fn renders_normal_narrow_and_tiny_with_unicode_and_editor() {
@@ -608,6 +854,46 @@ mod tests {
                 .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 4)
         );
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn deletion_prompt_shows_target_warning_and_cancel_controls_at_narrow_widths() {
+        for (width, height) in [(120, 35), (45, 20), (22, 12), (16, 7), (10, 4), (1, 1)] {
+            for block_type in ["paragraph", "child_page", "child_database", "toggle"] {
+                let (tx, _) = mpsc::unbounded_channel();
+                let mut app = App::new(Arc::new(DemoService), tx, true);
+                let mut block = crate::model::tests::paragraph();
+                block.block_type = block_type.into();
+                block.children = block_type == "toggle";
+                block.child_page = block_type == "child_page";
+                block.text = "你好 🦀 preview\nsecond line ".repeat(50);
+                app.pending_delete = Some(crate::app::PendingDelete {
+                    block,
+                    parent: "page".into(),
+                    index: 0,
+                });
+                app.confirm = Some(Confirm::Delete);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| Ui::default().draw(f, &app)).unwrap();
+                let contents: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                if width >= 22 {
+                    assert!(contents.contains("DELETE BLOCK"));
+                    assert!(contents.contains(block_type));
+                    assert!(contents.contains('你') && contents.contains('好'));
+                    assert!(contents.contains("y delete"));
+                    assert!(contents.contains("n/Esc cancel"));
+                    if block_type != "paragraph" {
+                        assert!(contents.contains("Includes contents."));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

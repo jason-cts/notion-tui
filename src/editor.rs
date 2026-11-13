@@ -127,13 +127,33 @@ impl Buffer {
 pub struct Editor {
     pub target: Target,
     pub buffer: Buffer,
+    pub row: Option<RowDraft>,
     pub kind: Kind,
     pub confirmed: bool,
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RowDraft {
+    pub cells: Vec<Buffer>,
+    pub active: usize,
+}
+
 impl Editor {
     pub fn new(target: Target) -> Self {
+        let row = match &target {
+            Target::Edit(block) if block.editable_table_row() => Some(RowDraft {
+                cells: block
+                    .table_cells
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|cell| Buffer::new(cell.text.clone()))
+                    .collect(),
+                active: 0,
+            }),
+            _ => None,
+        };
         let (text, kind) = match &target {
             Target::Edit(b) => (b.text.clone(), b.kind.unwrap_or(Kind::Paragraph)),
             _ => (String::new(), Kind::Paragraph),
@@ -141,9 +161,95 @@ impl Editor {
         Self {
             target,
             buffer: Buffer::new(text),
+            row,
             kind,
             confirmed: false,
             error: None,
+        }
+    }
+
+    pub fn active_buffer(&self) -> &Buffer {
+        self.row
+            .as_ref()
+            .map_or(&self.buffer, |row| &row.cells[row.active])
+    }
+
+    fn active_buffer_mut(&mut self) -> &mut Buffer {
+        match &mut self.row {
+            Some(row) => &mut row.cells[row.active],
+            None => &mut self.buffer,
+        }
+    }
+
+    pub fn insert(&mut self, text: &str) {
+        let before = self.active_buffer().text.clone();
+        let text = if matches!(self.target, Target::Create(_)) {
+            text.replace(['\n', '\r'], " ")
+        } else {
+            text.to_owned()
+        };
+        self.active_buffer_mut().insert(&text);
+        if self.active_buffer().text != before {
+            self.confirmed = false;
+        }
+    }
+
+    pub fn key(&mut self, key: KeyEvent) {
+        if let Some(row) = &mut self.row {
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                let backwards =
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                row.active = (row.active + if backwards { row.cells.len() - 1 } else { 1 })
+                    % row.cells.len();
+                return;
+            }
+        } else if key.code == KeyCode::Tab {
+            self.cycle_kind();
+            return;
+        }
+        let before = self.active_buffer().text.clone();
+        let multiline = !matches!(self.target, Target::Create(_));
+        self.active_buffer_mut().key(key, multiline);
+        if self.active_buffer().text != before {
+            self.confirmed = false;
+        }
+    }
+
+    pub fn character_count(&self) -> usize {
+        self.row.as_ref().map_or_else(
+            || self.buffer.text.chars().count(),
+            |row| row.cells.iter().map(|cell| cell.text.chars().count()).sum(),
+        )
+    }
+
+    pub fn changed(&self) -> bool {
+        match &self.target {
+            Target::Edit(block) => match &self.row {
+                Some(row) => row
+                    .cells
+                    .iter()
+                    .zip(block.table_cells.as_ref().unwrap())
+                    .any(|(draft, original)| draft.text != original.text),
+                None => self.buffer.text != block.text,
+            },
+            _ => true,
+        }
+    }
+
+    pub fn needs_formatting_confirmation(&self) -> bool {
+        if self.confirmed {
+            return false;
+        }
+        match &self.target {
+            Target::Edit(block) => match &self.row {
+                Some(row) => row
+                    .cells
+                    .iter()
+                    .zip(block.table_cells.as_ref().unwrap())
+                    .any(|(draft, original)| original.styled && draft.text != original.text),
+                None => block.styled && self.changed(),
+            },
+            _ => false,
         }
     }
 
@@ -155,13 +261,19 @@ impl Editor {
     }
 
     pub fn write(&self) -> Result<Write, &'static str> {
-        if self.buffer.text.chars().count() > 100_000 {
+        if self.character_count() > 100_000 {
             return Err("Text is limited to 100,000 characters per block");
         }
         Ok(match &self.target {
-            Target::Edit(original) => Write::Update {
-                original: original.clone(),
-                text: Some(self.buffer.text.clone()),
+            Target::Edit(original) => match &self.row {
+                Some(row) => Write::UpdateTableRow {
+                    original: original.clone(),
+                    cells: row.cells.iter().map(|cell| cell.text.clone()).collect(),
+                },
+                None => Write::Update {
+                    original: original.clone(),
+                    text: Some(self.buffer.text.clone()),
+                },
             },
             Target::Append { parent, after } => Write::Append {
                 parent: parent.clone(),
@@ -188,6 +300,56 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_row_editing_switches_cells_and_preserves_cursors() {
+        let mut editor = Editor::new(Target::Edit(crate::model::tests::table_row()));
+        assert!(!editor.changed());
+        editor.key(KeyCode::Tab.into());
+        assert_eq!(editor.row.as_ref().unwrap().active, 1);
+        editor.key(KeyCode::Home.into());
+        editor.key(KeyCode::Right.into());
+        let cursor = editor.active_buffer().cursor;
+        editor.key(KeyCode::BackTab.into());
+        editor.insert("\r\n🦀\t\x1b");
+        assert!(editor.active_buffer().text.ends_with("\n🦀    "));
+        assert!(!editor.needs_formatting_confirmation());
+        editor.key(KeyCode::Tab.into());
+        assert_eq!(editor.active_buffer().cursor, cursor);
+        editor.key(KeyCode::Enter.into());
+        assert!(editor.needs_formatting_confirmation());
+        editor.confirmed = true;
+        editor.key(KeyCode::Left.into());
+        editor.key(KeyCode::Tab.into());
+        assert!(editor.confirmed);
+        editor.key(KeyCode::BackTab.into());
+        editor.key(KeyCode::Backspace.into());
+        assert!(!editor.confirmed);
+        editor.key(KeyCode::BackTab.into());
+        editor.key(KeyCode::BackTab.into());
+        assert_eq!(editor.row.as_ref().unwrap().active, 2);
+        editor.insert("empty no longer");
+        let Write::UpdateTableRow { cells, .. } = editor.write().unwrap() else {
+            panic!("wrong write");
+        };
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[2], "empty no longer");
+    }
+
+    #[test]
+    fn table_row_character_limit_counts_all_cells() {
+        let mut editor = Editor::new(Target::Edit(crate::model::tests::table_row()));
+        let row = editor.row.as_mut().unwrap();
+        row.cells = vec![
+            Buffer::new("🦀".repeat(50_000)),
+            Buffer::new("你".repeat(50_000)),
+            Buffer::default(),
+        ];
+        assert_eq!(editor.character_count(), 100_000);
+        assert!(editor.write().is_ok());
+        editor.insert("a");
+        assert!(editor.write().is_err());
+    }
     #[test]
     fn editing_unicode_and_multiline_maintains_byte_boundaries() {
         let mut b = Buffer::new("你好\ncafé".into());

@@ -59,6 +59,7 @@ pub enum Message {
         result: Result<(Location, Vec<BlockItem>), String>,
     },
     Saved(Result<Option<PageItem>, String>),
+    Deleted(Result<(), String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,13 @@ pub enum Confirm {
     Formatting,
     Discard,
     Quit,
+    Delete,
+}
+
+pub struct PendingDelete {
+    pub block: BlockItem,
+    pub parent: String,
+    pub index: usize,
 }
 
 pub struct LinkPicker {
@@ -87,6 +95,7 @@ pub struct App {
     pub search: Option<Buffer>,
     pub editor: Option<Editor>,
     pub confirm: Option<Confirm>,
+    pub pending_delete: Option<PendingDelete>,
     pub help: bool,
     pub help_scroll: u16,
     pub viewer: Option<(BlockLabel, u16)>,
@@ -102,6 +111,8 @@ pub struct App {
     search_generation: u64,
     content_generation: u64,
     selection_after_insert: Option<(String, String)>,
+    selection_after_update: Option<(String, String)>,
+    selection_after_delete: Option<(String, usize)>,
     service: Service,
     sender: mpsc::UnboundedSender<Message>,
 }
@@ -125,6 +136,7 @@ impl App {
             search: None,
             editor: None,
             confirm: None,
+            pending_delete: None,
             help: false,
             help_scroll: 0,
             viewer: None,
@@ -139,6 +151,8 @@ impl App {
             search_generation: 0,
             content_generation: 0,
             selection_after_insert: None,
+            selection_after_update: None,
+            selection_after_delete: None,
         }
     }
 
@@ -224,6 +238,26 @@ impl App {
         });
     }
 
+    fn delete_block(&mut self) {
+        let Some(target) = &self.pending_delete else {
+            return;
+        };
+        let original = target.block.clone();
+        self.saving = true;
+        self.error = false;
+        self.status = "Deleting…".into();
+        let service = self.service.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = service
+                .write(Write::Delete { original })
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+            let _ = sender.send(Message::Deleted(result));
+        });
+    }
+
     pub fn receive(&mut self, message: Message) {
         match message {
             Message::DatabaseMeta {
@@ -269,6 +303,12 @@ impl App {
                 self.loading_content = false;
                 match result {
                     Ok((location, blocks)) => {
+                        if let Some((parent, id)) = self.selection_after_update.take()
+                            && parent == location.id
+                            && let Some(index) = blocks.iter().position(|block| block.id == id)
+                        {
+                            self.block_selected = index;
+                        }
                         if let Some((parent, after)) = self.selection_after_insert.take()
                             && parent == location.id
                         {
@@ -277,6 +317,11 @@ impl App {
                                 .position(|block| block.id == after)
                                 .map_or(0, |index| (index + 1).min(blocks.len().saturating_sub(1)));
                         }
+                        if let Some((parent, index)) = self.selection_after_delete.take()
+                            && parent == location.id
+                        {
+                            self.block_selected = index.min(blocks.len().saturating_sub(1));
+                        }
                         if let Some(last) = self.path.last_mut() {
                             *last = location;
                         }
@@ -284,9 +329,36 @@ impl App {
                         self.ensure_database_metadata(false);
                         self.error = false;
                         self.status = format!(
-                            "{} blocks · e edit · a append · n child page",
+                            "{} blocks · e edit · d delete · a append · n child page",
                             self.blocks.len()
                         );
+                    }
+                    Err(error) => self.fail(error),
+                }
+            }
+            Message::Deleted(result) => {
+                let Some(target) = self.pending_delete.take() else {
+                    return;
+                };
+                self.saving = false;
+                match result {
+                    Ok(()) => {
+                        self.databases.remove(&target.block.id);
+                        self.metadata_pending.remove(&target.block.id);
+                        *self
+                            .metadata_generations
+                            .entry(target.block.id)
+                            .or_default() += 1;
+                        self.error = false;
+                        self.status = "Deleted · moved to Notion Trash".into();
+                        if self
+                            .location()
+                            .is_some_and(|location| location.id == target.parent)
+                        {
+                            self.selection_after_delete = Some((target.parent, target.index));
+                            self.load();
+                        }
+                        self.start_search();
                     }
                     Err(error) => self.fail(error),
                 }
@@ -295,6 +367,14 @@ impl App {
                 self.saving = false;
                 match result {
                     Ok(created) => {
+                        self.selection_after_update = self.editor.as_ref().and_then(|editor| {
+                            if let Target::Edit(block) = &editor.target {
+                                self.location()
+                                    .map(|location| (location.id.clone(), block.id.clone()))
+                            } else {
+                                None
+                            }
+                        });
                         self.selection_after_insert = self.editor.as_ref().and_then(|editor| {
                             if let Target::Append {
                                 parent,
@@ -334,11 +414,7 @@ impl App {
             return;
         }
         if let Some(editor) = &mut self.editor {
-            if matches!(editor.target, Target::Create(_)) {
-                editor.buffer.insert(&text.replace(['\n', '\r'], " "));
-            } else {
-                editor.buffer.insert(text);
-            }
+            editor.insert(text);
         } else if let Some(search) = &mut self.search {
             search.insert(&text.replace(['\n', '\r'], " "));
         }
@@ -366,9 +442,15 @@ impl App {
                         }
                         Confirm::Discard => self.editor = None,
                         Confirm::Quit => self.quit = true,
+                        Confirm::Delete => self.delete_block(),
                     }
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.confirm = None,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm = None;
+                    if confirm == Confirm::Delete {
+                        self.pending_delete = None;
+                    }
+                }
                 _ => {}
             }
             return;
@@ -428,12 +510,7 @@ impl App {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.save_editor()
                 }
-                KeyCode::Tab => self.editor.as_mut().unwrap().cycle_kind(),
-                _ => {
-                    let editor = self.editor.as_mut().unwrap();
-                    let multiline = !matches!(editor.target, Target::Create(_));
-                    editor.buffer.key(key, multiline);
-                }
+                _ => self.editor.as_mut().unwrap().key(key),
             }
             return;
         }
@@ -505,11 +582,28 @@ impl App {
                     self.focus = Focus::Pages;
                 }
             }
+            KeyCode::Char('d') if self.focus == Focus::Content => {
+                if !self.loading_content
+                    && let Some(location) = self.location()
+                    && location.kind != LocationKind::Database
+                    && let Some(block) = self.blocks.get(self.block_selected)
+                    && !block.id.is_empty()
+                {
+                    self.pending_delete = Some(PendingDelete {
+                        block: block.clone(),
+                        parent: location.id.clone(),
+                        index: self.block_selected,
+                    });
+                    self.confirm = Some(Confirm::Delete);
+                }
+            }
             KeyCode::Char('e') if self.focus == Focus::Content => {
                 if let Some(block) = self.blocks.get(self.block_selected).cloned() {
                     if block.protected {
                         self.fail("Mentions and equations are read-only");
-                    } else if block.kind.is_none() || block.id.is_empty() {
+                    } else if (block.kind.is_none() && !block.editable_table_row())
+                        || block.id.is_empty()
+                    {
                         self.fail("This block type is read-only");
                     } else {
                         self.editor = Some(Editor::new(Target::Edit(block)));
@@ -642,19 +736,14 @@ impl App {
         let Some(editor) = &self.editor else {
             return;
         };
-        if let Target::Edit(block) = &editor.target
-            && block.styled
-            && !editor.confirmed
-            && editor.buffer.text != block.text
-        {
+        if editor.needs_formatting_confirmation() {
             self.confirm = Some(Confirm::Formatting);
             return;
         }
-        if let Target::Edit(block) = &editor.target
-            && editor.buffer.text == block.text
-        {
+        if !editor.changed() {
             self.editor = None;
             self.status = "No changes".into();
+            self.error = false;
             return;
         }
         match editor.write() {

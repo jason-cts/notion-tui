@@ -598,6 +598,72 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
 }
 
 #[tokio::test]
+async fn oauth_deletion_refreshes_credentials_without_replaying_the_delete() {
+    for rejected_method in ["GET", "DELETE"] {
+        let server = MockServer::start().await;
+        let (_directory, store) = saved_store().await;
+        let value = json!({
+            "object":"block", "id":"block", "type":"paragraph",
+            "created_time":"2026-01-01T00:00:00Z", "last_edited_time":"2026-01-01T00:00:00Z",
+            "created_by":{"id":"user"}, "last_edited_by":{"id":"user"},
+            "has_children":false, "in_trash":false,
+            "paragraph":{"rich_text":[], "color":"default"}
+        });
+        Mock::given(method("GET"))
+            .and(path("/blocks/block"))
+            .and(header("Authorization", "Bearer old"))
+            .respond_with(if rejected_method == "GET" {
+                unauthorized()
+            } else {
+                ResponseTemplate::new(200).set_body_json(value.clone())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/blocks/block"))
+            .and(header("Authorization", "Bearer old"))
+            .respond_with(unauthorized())
+            .expect(if rejected_method == "DELETE" { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        refresh_mock(&server).await;
+        let api = OAuthService::new(session(client(&server), store.clone()))
+            .await
+            .unwrap();
+        let original = crate::model::BlockItem::from_value(&value);
+        let error = api
+            .write(Write::Delete {
+                original: original.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Deletion was not retried"));
+        assert!(error.to_string().contains("press d and confirm again"));
+        assert!(!error.to_string().contains("Draft"));
+        assert_eq!(store.load().unwrap().unwrap().access_token, "new");
+        // The refreshed token is used only when the user explicitly retries.
+        Mock::given(method("GET"))
+            .and(path("/blocks/block"))
+            .and(header("Authorization", "Bearer new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(value))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/blocks/block"))
+            .and(header("Authorization", "Bearer new"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object":"block","id":"block"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        api.write(Write::Delete { original }).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn logout_cannot_be_undone_by_a_stale_refresh() {
     let server = MockServer::start().await;
     let (_directory, store) = saved_store().await;

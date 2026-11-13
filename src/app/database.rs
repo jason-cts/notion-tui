@@ -258,7 +258,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.load_database(true),
-            KeyCode::Char('e' | 'a' | 'n' | ' ') => self
+            KeyCode::Char('e' | 'd' | 'a' | 'n' | ' ') => self
                 .fail("Database browsing is read-only. Enter opens a page for editing its content"),
             KeyCode::Char('v' | 'o') => {
                 let detail = self

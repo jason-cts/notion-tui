@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{AuthError, OAuthSession, is_unauthorized};
 use crate::database::{DatabaseData, DatabaseMeta};
-use crate::model::{BlockItem, Kind, PageItem, append_payload, update_payload};
+use crate::model::{BlockItem, Kind, PageItem, append_payload, table_row_payload, update_payload};
 use rusticnotion::models::view::View;
 
 pub(crate) mod database;
@@ -20,9 +20,16 @@ pub type Progress = Arc<dyn Fn(usize) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub enum Write {
+    Delete {
+        original: BlockItem,
+    },
     Update {
         original: BlockItem,
         text: Option<String>,
+    },
+    UpdateTableRow {
+        original: BlockItem,
+        cells: Vec<String>,
     },
     Append {
         parent: String,
@@ -81,13 +88,21 @@ impl ApiService {
     }
 
     async fn patch(&self, path: &str, payload: Value) -> Result<()> {
-        let response = self
-            .http
-            .patch(format!("{}{path}", self.base_url))
-            .json(&payload)
-            .send()
-            .await
-            .context("Save response unavailable; inspect Notion before retrying")?;
+        self.send_write(
+            self.http
+                .patch(format!("{}{path}", self.base_url))
+                .json(&payload),
+            false,
+        )
+        .await
+    }
+
+    async fn send_write(&self, request: reqwest::RequestBuilder, deleting: bool) -> Result<()> {
+        let response = request.send().await.context(if deleting {
+            "Delete response unavailable; inspect Notion before retrying"
+        } else {
+            "Save response unavailable; inspect Notion before retrying"
+        })?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(AuthError::Unauthorized.into());
@@ -97,16 +112,18 @@ impl ApiService {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body: Value = response
-            .json()
-            .await
-            .context("Unreadable save response; inspect Notion before retrying")?;
+        let body: Value = response.json().await.context(if deleting {
+            "Unreadable delete response; inspect Notion before retrying"
+        } else {
+            "Unreadable save response; inspect Notion before retrying"
+        })?;
         if !status.is_success() {
             let message = body["message"].as_str().unwrap_or("Request failed");
             if status.as_u16() == 429 {
                 bail!(
-                    "Rate limited; wait {} seconds before saving again",
-                    retry.as_deref().unwrap_or("a few")
+                    "Rate limited; wait {} seconds before {} again",
+                    retry.as_deref().unwrap_or("a few"),
+                    if deleting { "deleting" } else { "saving" }
                 );
             }
             bail!("Notion {status}: {message}");
@@ -202,9 +219,18 @@ impl NotionService for OAuthService {
         .await
     }
     async fn write(&self, write: Write) -> Result<Option<PageItem>> {
+        let deleting = matches!(&write, Write::Delete { .. });
         let (token, api) = self.client().await?;
         match api.write(write).await {
             Err(error) if is_unauthorized(&error) => {
+                if deleting {
+                    self.session.refresh(&token).await.context(
+                        "Could not renew OAuth login. Deletion was not retried; check your connection or run notion-tui --login",
+                    )?;
+                    bail!(
+                        "OAuth login refreshed. Deletion was not retried; press d and confirm again when ready"
+                    );
+                }
                 self.session.refresh(&token).await.context("Could not renew OAuth login. Draft retained; check your connection or run notion-tui --login")?;
                 bail!(
                     "OAuth login refreshed. Draft retained; save again when ready. The write was not retried"
@@ -293,6 +319,48 @@ impl NotionService for ApiService {
 
     async fn write(&self, write: Write) -> Result<Option<PageItem>> {
         match write {
+            Write::Delete { original } => {
+                if original.id.is_empty() || original.modified.is_empty() {
+                    bail!(
+                        "Cannot delete a block without an ID and modification timestamp; refresh before deleting"
+                    );
+                }
+                let fresh = self
+                    .api
+                    .get_block_shallow(original.id.parse::<BlockId>()?)
+                    .await
+                    .context("Could not check for remote changes; block was not deleted")?;
+                let fresh = BlockItem::from_value(&serde_json::to_value(fresh)?);
+                if fresh.modified != original.modified || fresh.block_type != original.block_type {
+                    bail!("Conflict: block changed in Notion. Refresh before deleting again");
+                }
+                self.send_write(
+                    self.http
+                        .delete(format!("{}/blocks/{}", self.base_url, original.id)),
+                    true,
+                )
+                .await?;
+            }
+            Write::UpdateTableRow { original, cells } => {
+                let payload = table_row_payload(&original, &cells).map_err(anyhow::Error::msg)?;
+                let fresh = self
+                    .api
+                    .get_block_shallow(original.id.parse::<BlockId>()?)
+                    .await
+                    .context("Could not check for remote changes; draft retained")?;
+                let fresh = BlockItem::from_value(&serde_json::to_value(fresh)?);
+                if original.modified.is_empty()
+                    || fresh.modified != original.modified
+                    || fresh.block_type != "table_row"
+                    || fresh.table_cells.as_ref().map(Vec::len) != Some(cells.len())
+                {
+                    bail!(
+                        "Conflict: table row changed in Notion. Draft retained; cancel and refresh before editing again"
+                    );
+                }
+                self.patch(&format!("/blocks/{}", original.id), payload)
+                    .await?;
+            }
             Write::Update { original, text } => {
                 let fresh = self
                     .api
@@ -375,6 +443,24 @@ impl NotionService for DemoService {
         })
     }
     async fn children(&self, id: &str) -> Result<Vec<BlockItem>> {
+        if id == "demo-table" {
+            return Ok(vec![
+                BlockItem::from_value(
+                    &json!({"id":"demo-row-plain","type":"table_row","last_edited_time":"demo",
+                    "table_row":{"cells":[
+                        [{"type":"text","plain_text":"Alpha","text":{"content":"Alpha"}}],
+                        [{"type":"text","plain_text":"Beta","text":{"content":"Beta"}}], []
+                    ]}}),
+                ),
+                BlockItem::from_value(
+                    &json!({"id":"demo-row-styled","type":"table_row","last_edited_time":"demo",
+                    "table_row":{"cells":[
+                        [{"type":"text","plain_text":"Styled","text":{"content":"Styled"},"annotations":{"bold":true}}],
+                        [{"type":"text","plain_text":"Link","text":{"content":"Link","link":{"url":"https://example.com/"}},"href":"https://example.com/"}], []
+                    ]}}),
+                ),
+            ]);
+        }
         let rows = if id == "nested" {
             vec![("paragraph", "Nested content · Backspace goes back", false)]
         } else {
@@ -406,7 +492,12 @@ impl NotionService for DemoService {
                 )
             })
             .collect();
-        if id != "nested" {
+        if id == "nested" {
+            blocks.push(BlockItem::from_value(
+                &json!({"id":"demo-table","type":"table","has_children":true,
+                "table":{"table_width":3,"has_column_header":false,"has_row_header":false}}),
+            ));
+        } else {
             blocks.push(BlockItem::from_value(
                 &json!({"id":"demo-rich-text", "type":"paragraph", "paragraph":{"rich_text":[
                     {"type":"text","plain_text":"Bold", "annotations":{"bold":true}},
@@ -424,7 +515,10 @@ impl NotionService for DemoService {
         }
         Ok(blocks)
     }
-    async fn write(&self, _: Write) -> Result<Option<PageItem>> {
+    async fn write(&self, write: Write) -> Result<Option<PageItem>> {
+        if matches!(write, Write::Delete { .. }) {
+            bail!("Demo is read-only. Connect NOTION_API_TOKEN to delete blocks");
+        }
         bail!("Demo is read-only. Connect NOTION_API_TOKEN to save changes")
     }
 }

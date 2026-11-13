@@ -31,6 +31,238 @@ async fn drain_content(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>)
     .unwrap();
 }
 
+struct DeleteService {
+    blocks: std::sync::Mutex<Vec<BlockItem>>,
+    deleted: std::sync::Mutex<Vec<BlockItem>>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::service::NotionService for DeleteService {
+    async fn search(&self, _: &str) -> anyhow::Result<Vec<PageItem>> {
+        Ok(vec![])
+    }
+    async fn page(&self, id: &str) -> anyhow::Result<PageItem> {
+        Ok(PageItem {
+            id: id.into(),
+            title: "Parent".into(),
+        })
+    }
+    async fn children(&self, _: &str) -> anyhow::Result<Vec<BlockItem>> {
+        Ok(self.blocks.lock().unwrap().clone())
+    }
+    async fn write(&self, write: Write) -> anyhow::Result<Option<PageItem>> {
+        let Write::Delete { original } = write else {
+            panic!("expected deletion");
+        };
+        self.deleted.lock().unwrap().push(original.clone());
+        if self.fail {
+            anyhow::bail!("Delete response unavailable; inspect Notion before retrying");
+        }
+        self.blocks
+            .lock()
+            .unwrap()
+            .retain(|block| block.id != original.id);
+        Ok(None)
+    }
+}
+
+fn deletion_app(
+    count: usize,
+    fail: bool,
+) -> (App, mpsc::UnboundedReceiver<Message>, Arc<DeleteService>) {
+    let blocks: Vec<_> = (0..count)
+        .map(|index| {
+            let mut block = paragraph();
+            block.id = format!("block-{index}");
+            block
+        })
+        .collect();
+    let service = Arc::new(DeleteService {
+        blocks: std::sync::Mutex::new(blocks.clone()),
+        deleted: std::sync::Mutex::new(vec![]),
+        fail,
+    });
+    let (mut app, _) = app();
+    let (tx, rx) = mpsc::unbounded_channel();
+    app.sender = tx;
+    app.service = service.clone();
+    app.demo = false;
+    app.blocks = blocks;
+    app.pages = vec![PageItem {
+        id: "old-search-result".into(),
+        title: "Old result".into(),
+    }];
+    (app, rx, service)
+}
+
+async fn finish_deletion(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while app.saving || app.loading_content || app.loading_search {
+            app.receive(rx.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn deletion_confirmation_captures_the_target_and_isolates_input() {
+    let (mut app, mut rx, service) = deletion_app(3, false);
+    app.block_selected = 1;
+    app.key(KeyCode::Char('d').into());
+    assert!(app.confirm == Some(Confirm::Delete));
+    assert_eq!(app.pending_delete.as_ref().unwrap().block.id, "block-1");
+    assert_eq!(app.pending_delete.as_ref().unwrap().parent, "page");
+    for key in [
+        KeyCode::Enter.into(),
+        KeyCode::Char('j').into(),
+        KeyCode::Tab.into(),
+        KeyCode::Char('q').into(),
+        KeyCode::Char('e').into(),
+        KeyCode::Char('/').into(),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        app.key(key);
+        assert!(app.confirm == Some(Confirm::Delete));
+        assert_eq!(app.block_selected, 1);
+        assert!(!app.saving && !app.quit);
+    }
+    app.paste("y");
+    assert!(service.deleted.lock().unwrap().is_empty());
+    // A refreshed display must not alter the captured confirmation target.
+    app.blocks[1].text = "changed display".into();
+    app.key(KeyCode::Char('Y').into());
+    assert!(app.confirm.is_none());
+    assert!(app.saving);
+    for key in [KeyCode::Char('q'), KeyCode::Char('j'), KeyCode::Char('d')] {
+        app.key(key.into());
+    }
+    assert!(!app.quit);
+    assert_eq!(app.block_selected, 1);
+    finish_deletion(&mut app, &mut rx).await;
+    let deleted = service.deleted.lock().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].id, "block-1");
+    assert_ne!(deleted[0].text, "changed display");
+    assert_eq!(app.blocks[app.block_selected].id, "block-2");
+    assert!(app.pending_delete.is_none());
+}
+
+#[tokio::test]
+async fn deletion_cancellation_and_ineligible_contexts_never_write() {
+    let (mut app, mut rx, service) = deletion_app(1, false);
+    for cancel in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+        app.key(KeyCode::Char('d').into());
+        app.key(cancel.into());
+        assert!(app.confirm.is_none() && app.pending_delete.is_none());
+        assert_eq!(app.blocks.len(), 1);
+    }
+    app.focus = Focus::Pages;
+    app.key(KeyCode::Char('d').into());
+    app.focus = Focus::Content;
+    app.loading_content = true;
+    app.key(KeyCode::Char('d').into());
+    app.loading_content = false;
+    app.block_selected = 100;
+    app.key(KeyCode::Char('d').into());
+    app.block_selected = 0;
+    app.blocks[0].id.clear();
+    app.key(KeyCode::Char('d').into());
+    app.blocks.clear();
+    app.key(KeyCode::Char('d').into());
+    app.blocks.push(paragraph());
+    app.path.last_mut().unwrap().kind = LocationKind::Database;
+    app.key(KeyCode::Char('d').into());
+    app.path.last_mut().unwrap().kind = LocationKind::Page;
+    app.editor = Some(Editor::new(Target::Edit(paragraph())));
+    app.key(KeyCode::Char('d').into());
+    assert!(app.editor.as_ref().unwrap().buffer.text.contains('d'));
+    app.editor = None;
+    app.search = Some(Buffer::new(String::new()));
+    app.key(KeyCode::Char('d').into());
+    assert_eq!(app.search.as_ref().unwrap().text, "d");
+    app.search = None;
+    app.viewer = Some((paragraph().label(1, 0), 0));
+    app.key(KeyCode::Char('d').into());
+    assert!(app.viewer.is_none());
+    app.help = true;
+    app.key(KeyCode::Char('d').into());
+    assert!(!app.help);
+    assert!(app.confirm.is_none() && app.pending_delete.is_none() && !app.saving);
+    assert!(service.deleted.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn successful_deletion_restores_selection_for_first_middle_last_and_only_blocks() {
+    for (count, index, expected) in [(3, 0, 0), (3, 1, 1), (3, 2, 1), (1, 0, 0)] {
+        let (mut app, mut rx, service) = deletion_app(count, false);
+        app.block_selected = index;
+        app.key(KeyCode::Char('d').into());
+        app.key(KeyCode::Char('y').into());
+        finish_deletion(&mut app, &mut rx).await;
+        assert_eq!(app.blocks.len(), count - 1);
+        assert_eq!(app.block_selected, expected);
+        assert_eq!(service.deleted.lock().unwrap().len(), 1);
+        assert!(app.pages.is_empty(), "page search was refreshed");
+        assert!(!app.error);
+    }
+}
+
+#[tokio::test]
+async fn failed_deletion_retains_selection_and_requires_a_new_confirmation() {
+    let (mut app, mut rx, service) = deletion_app(3, true);
+    app.block_selected = 1;
+    app.key(KeyCode::Char('d').into());
+    app.key(KeyCode::Char('y').into());
+    finish_deletion(&mut app, &mut rx).await;
+    assert!(app.error && app.status.contains("inspect Notion"));
+    assert_eq!(app.blocks.len(), 3);
+    assert_eq!(app.block_selected, 1);
+    assert!(app.pending_delete.is_none() && app.confirm.is_none());
+    assert!(rx.try_recv().is_err());
+    app.key(KeyCode::Char('y').into());
+    assert!(!app.saving);
+    assert_eq!(service.deleted.lock().unwrap().len(), 1);
+    app.key(KeyCode::Char('d').into());
+    assert!(!app.saving);
+    app.key(KeyCode::Char('y').into());
+    finish_deletion(&mut app, &mut rx).await;
+    assert_eq!(service.deleted.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn deletion_accepts_protected_and_unsupported_blocks_and_invalidates_database_metadata() {
+    for block_type in [
+        "child_page",
+        "child_database",
+        "table_row",
+        "unsupported",
+        "paragraph",
+    ] {
+        let (mut app, mut rx, _) = deletion_app(1, false);
+        app.blocks[0].block_type = block_type.into();
+        app.blocks[0].protected = true;
+        let id = app.blocks[0].id.clone();
+        app.databases.insert(id.clone(), DatabaseState::default());
+        app.metadata_pending.insert(id.clone());
+        app.metadata_generations.insert(id.clone(), 7);
+        app.key(KeyCode::Char('d').into());
+        assert!(app.confirm == Some(Confirm::Delete));
+        app.key(KeyCode::Char('y').into());
+        finish_deletion(&mut app, &mut rx).await;
+        app.receive(Message::DatabaseMeta {
+            id: id.clone(),
+            generation: 7,
+            result: Err("stale".into()),
+        });
+        assert!(!app.databases.contains_key(&id));
+        assert!(!app.metadata_pending.contains(&id));
+        assert_eq!(app.metadata_generations.get(&id), Some(&8));
+    }
+}
+
 #[tokio::test]
 async fn child_database_opens_switches_views_and_restores_row_after_page_navigation() {
     let (mut app, mut rx) = app();
@@ -53,7 +285,7 @@ async fn child_database_opens_switches_views_and_restores_row_after_page_navigat
     drain_content(&mut app, &mut rx).await;
     assert_eq!(app.database().unwrap().view().unwrap().view_type, "board");
     assert_eq!(app.database().unwrap().selected, 1);
-    for key in ['e', 'a', 'n', ' '] {
+    for key in ['e', 'd', 'a', 'n', ' '] {
         app.key(KeyCode::Char(key).into());
         assert!(app.editor.is_none());
         assert!(!app.saving);
@@ -364,6 +596,103 @@ async fn failed_save_keeps_draft_and_does_not_retry() {
     app.key(KeyCode::Esc.into());
     app.key(KeyCode::Char('y').into());
     assert!(app.editor.is_none());
+}
+
+#[test]
+fn table_row_noop_closes_and_protected_rows_cannot_open() {
+    let (mut app, mut rx) = app();
+    app.blocks = vec![crate::model::tests::table_row()];
+    app.key(KeyCode::Char('e').into());
+    assert!(app.editor.as_ref().unwrap().row.is_some());
+    app.key(ctrl_s());
+    assert!(app.editor.is_none());
+    assert!(!app.saving);
+    assert_eq!(app.status, "No changes");
+    assert!(rx.try_recv().is_err());
+    app.blocks[0].protected = true;
+    app.key(KeyCode::Char('e').into());
+    assert!(app.editor.is_none());
+    assert!(app.error);
+}
+
+#[tokio::test]
+async fn table_row_failed_save_retains_all_cells_active_cursor_and_confirmation_scope() {
+    let (mut app, mut rx) = app();
+    app.blocks = vec![crate::model::tests::table_row()];
+    app.key(KeyCode::Char('e').into());
+    app.paste(" first draft");
+    assert!(!app.editor.as_ref().unwrap().needs_formatting_confirmation());
+    app.key(KeyCode::Tab.into());
+    app.paste(" styled draft");
+    app.key(ctrl_s());
+    assert!(app.confirm == Some(Confirm::Formatting));
+    app.key(KeyCode::Char('n').into());
+    assert!(!app.saving);
+    app.key(ctrl_s());
+    app.key(KeyCode::Char('y').into());
+    assert!(app.saving);
+    let draft = app.editor.as_ref().unwrap().row.clone().unwrap();
+    app.paste("must not arrive during save");
+    app.key(KeyCode::Tab.into());
+    app.receive(rx.recv().await.unwrap());
+    assert!(!app.saving);
+    let editor = app.editor.as_ref().unwrap();
+    assert!(editor.error.is_some());
+    let retained = editor.row.as_ref().unwrap();
+    assert_eq!(retained.active, draft.active);
+    for (before, after) in draft.cells.iter().zip(&retained.cells) {
+        assert_eq!(before.text, after.text);
+        assert_eq!(before.cursor, after.cursor);
+    }
+    assert!(rx.try_recv().is_err());
+    app.key(KeyCode::Tab.into());
+    app.paste("你🦀x");
+    app.key(KeyCode::Left.into());
+    app.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(app.editor.as_ref().unwrap().active_buffer().text, "你x");
+    app.key(ctrl_s());
+    assert!(app.confirm == Some(Confirm::Formatting));
+    app.key(KeyCode::Char('n').into());
+    app.key(KeyCode::Esc.into());
+    app.key(KeyCode::Char('n').into());
+    assert!(app.editor.is_some());
+    app.key(KeyCode::Esc.into());
+    app.key(KeyCode::Char('y').into());
+    assert!(app.editor.is_none());
+}
+
+#[tokio::test]
+async fn saved_table_row_refresh_restores_selection_by_id() {
+    let (mut app, _) = app();
+    let row = crate::model::tests::table_row();
+    app.blocks = vec![row.clone()];
+    app.key(KeyCode::Char('e').into());
+    app.paste(" revised");
+    // Exercise the successful response and a refreshed list with an inserted sibling.
+    app.receive(Message::Saved(Ok(None)));
+    assert!(app.editor.is_none());
+    assert!(app.loading_content);
+    app.receive(Message::Content {
+        generation: app.content_generation,
+        result: Ok((
+            app.location().unwrap().clone(),
+            vec![
+                {
+                    let mut sibling = paragraph();
+                    sibling.id = "sibling".into();
+                    sibling
+                },
+                {
+                    let mut sibling = paragraph();
+                    sibling.id = "other".into();
+                    sibling
+                },
+                row,
+            ],
+        )),
+    });
+    assert_eq!(app.block_selected, 2);
+    assert_eq!(app.blocks[app.block_selected].block_type, "table_row");
 }
 
 #[tokio::test]

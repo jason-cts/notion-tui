@@ -1,6 +1,6 @@
 # Notion TUI
 
-A keyboard-driven Notion client built with ratatui and [rusticnotion](https://github.com/jason-cts/rusticnotion). Search shared pages, browse databases, explore nested blocks, edit text, toggle tasks, append blocks, and create child pages.
+A keyboard-driven Notion client built with ratatui and [rusticnotion](https://github.com/jason-cts/rusticnotion). Search shared pages, browse databases, explore nested blocks, edit text, toggle tasks, append or delete blocks, and create child pages.
 
 ## Run
 
@@ -81,7 +81,8 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | `r` | Refresh the focused pane |
 | `v` | Open the full block in a scrollable reader |
 | `o` | Open the selected block's external link in your browser; choose when it contains multiple links |
-| `e` | Edit a paragraph, heading, list item, or to-do |
+| `e` | Edit a paragraph, heading, list item, to-do, or simple-table row |
+| `d` | Delete the selected block after confirmation |
 | Space | Toggle a to-do without changing its rich text |
 | `a` | Insert a block immediately after the selected block; create the first block in an empty location |
 | `n` | Create a child of the current page, including when viewing nested blocks |
@@ -91,6 +92,8 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 The editor supports multiline text, Unicode, bracketed paste, arrows, and Home/End. Tab cycles the type of an inserted block: paragraph, three heading levels, bullet, numbered item, or to-do. Ctrl-S saves; Esc asks before discarding the draft. In the full-block reader and help, ↑/↓ or `j`/`k` scroll and PageUp/PageDown move ten lines. In the reader, `o` opens its external links; another key closes it.
 
 Insertion stays at the current nesting level, directly after the block selected when you pressed `a`. Saving refreshes the list and selects the block just after that anchor. Failed saves retain the draft and its insertion point.
+
+Press `d` in a content-block list to review the selected block's type and text/title, then `y` to delete or `n`/Esc to cancel. Enter does not confirm. All block types can be deleted, including child pages, child databases, and containers with their contents. Deletion moves the block to Notion Trash, where it can be restored. Page search results and database records remain read-only. After deletion, the next block is selected, or the previous block when deleting the last item.
 
 Notion bold, italic, underline, and strikethrough annotations render as terminal styles, including combined styles within a block. Wrapping and the full-block reader preserve these spans. Exact appearance depends on your terminal and font. HTTP/HTTPS links appear cyan and underlined and emit OSC 8 hyperlinks for terminals that support clicking them. Use your terminal's usual link-opening gesture, or press `o` to launch the default browser. For a block with several targets, use ↑/↓ and Enter in the link chooser; Esc cancels. Browsing content alone never launches a browser.
 
@@ -118,11 +121,17 @@ Cargo may temporarily resolve that checkout into the lockfile. The declared depe
 
 ## Saving
 
-Editing replaces a block's rich text with plain text. Styled text and links require confirmation before replacement. Block colors, child blocks, and a to-do's checked state are preserved when editing text. Mentions, inline equations, and unsupported block types are read-only.
+Editing replaces a block's rich text with plain text. Styled text and links require confirmation before replacement. Block colors, child blocks, and a to-do's checked state are preserved when editing text. Mentions, inline equations, and unsupported block types cannot be edited; their blocks can still be deleted with confirmation.
+
+For a simple table, open its children with Enter, select a `table_row`, and press `e`. The row dialog provides one multiline field per cell, including empty cells. Tab and Shift-Tab cycle through cells, Enter inserts a newline, and Ctrl-S saves the whole row. Arrow keys, Home/End, Backspace, and bracketed paste work within the active cell. The dialog scrolls to keep the active cell visible; Esc asks before discarding all cell drafts.
+
+Only changed cells become plain text. Unchanged cells retain their original runs, styles, colors, and links. Changing a styled cell requires confirmation; further text changes require confirmation again. A row containing mentions, equations, or unrecognized rich text cannot be edited. Saving checks the row's timestamp, type, and cell count, preserves empty cells, and restores the selected row after refreshing. Failed saves retain every cell and cursor. Unchanged rows close without a request. Row drafts share the 100,000-character block limit; text runs are split at 2,000 characters. Adding rows or columns, removing columns, and editing database properties are excluded. Use `d` to delete a selected row with confirmation.
 
 Before updating a block, the app retrieves its current modification timestamp and rejects a conflicting edit. This is a best-effort check: Notion does not provide an atomic compare-and-update operation, so a change between the check and the save can still race. Failed saves retain the draft and show the error. There are no automatic write retries. If a response is lost, inspect Notion before retrying an append or page creation; the first request may have succeeded. Rate-limit errors show the requested waiting time.
 
-Drafts and navigation state live in memory. Quitting discards them. During a save, wait for the response before quitting. The app uses one API token or one saved OAuth workspace authorization and excludes database property editing, deletion, reordering, offline sync, and whole-page Markdown editing. Both clients use API version `2026-03-11` from rusticnotion's `NOTION_API_VERSION` constant. Insertions use `position.after_block` to retain their selected sibling anchor.
+Deletion also checks the block's timestamp and type before sending the request, with the same best-effort limitation. Failed deletions retain the list and selection. Deletions are never retried automatically, including after OAuth renewal; press `d` and confirm again to retry. If the response is unavailable or unreadable, inspect Notion first because deletion may have succeeded. Demo content remains read-only.
+
+Drafts and navigation state live in memory. Quitting discards them. During a save or deletion, wait for the response before quitting. The app uses one API token or one saved OAuth workspace authorization and excludes database property editing, database-record deletion, reordering, offline sync, and whole-page Markdown editing. Both clients use API version `2026-03-11` from rusticnotion's `NOTION_API_VERSION` constant. Insertions use `position.after_block` to retain their selected sibling anchor.
 
 ## Structure and dependency
 
@@ -148,6 +157,7 @@ python3 tests/terminal_smoke.py
 python3 tests/auth_smoke.py
 python3 tests/rich_text_smoke.py
 python3 tests/database_smoke.py
+python3 tests/table_row_smoke.py
 ```
 
 Unit and HTTP mock tests need no credentials; mocks bind local ports. The terminal smoke tests use Linux pseudo-terminals to exercise search, nested navigation, draft recovery, resizing, terminal restoration, interactive authentication, OAuth cancellation/denial, text styles, hyperlinks, and database list/board/table navigation. The authentication smoke test disables desktop launchers; the rich-text smoke test uses a fake browser to verify URL dispatch. None contacts Notion. The library's own tests are maintained in the rusticnotion repository.

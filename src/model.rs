@@ -1,5 +1,69 @@
 use crate::rich_text::{RichRun, external_url};
+use rusticnotion::models::{
+    requests::{RichTextContent, RichTextInput, TextInput},
+    text::{Annotations, Text},
+};
 use serde_json::{Value, json};
+
+#[derive(Clone, Debug)]
+pub struct TableCell {
+    pub text: String,
+    pub styled: bool,
+    // None means a mention, equation, or unrecognized run cannot safely round-trip.
+    pub input: Option<Vec<RichTextInput>>,
+}
+
+impl TableCell {
+    fn from_value(value: &Value) -> Self {
+        let runs = value.as_array();
+        let input = runs.and_then(|runs| {
+            runs.iter()
+                .map(|run| {
+                    if run["type"] != "text" {
+                        return None;
+                    }
+                    let text: Text = serde_json::from_value(run["text"].clone()).ok()?;
+                    let annotations: Option<Annotations> =
+                        serde_json::from_value(run["annotations"].clone()).ok()?;
+                    Some(RichTextInput {
+                        content: RichTextContent::Text {
+                            text: TextInput {
+                                content: text.content,
+                                link: text.link,
+                            },
+                        },
+                        annotations,
+                    })
+                })
+                .collect()
+        });
+        Self {
+            text: runs
+                .map(|runs| {
+                    runs.iter()
+                        .map(|run| RichRun::from_value(run).text)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            styled: runs.is_some_and(|runs| runs.iter().any(styled_run)),
+            input,
+        }
+    }
+}
+
+fn styled_run(run: &Value) -> bool {
+    !run["text"]["link"].is_null()
+        || !run["href"].is_null()
+        || run["annotations"].as_object().is_some_and(|annotations| {
+            annotations.iter().any(|(key, value)| {
+                if key == "color" {
+                    value.as_str().is_some_and(|color| color != "default")
+                } else {
+                    value.as_bool() == Some(true)
+                }
+            })
+        })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageItem {
@@ -49,6 +113,7 @@ pub struct BlockItem {
     pub block_type: String,
     pub text: String,
     pub rich_text: Vec<RichRun>,
+    pub table_cells: Option<Vec<TableCell>>,
     pub children: bool,
     pub checked: bool,
     pub kind: Option<Kind>,
@@ -111,22 +176,21 @@ impl BlockItem {
             run.url = body["url"].as_str().and_then(external_url);
             rich_text = vec![run];
         }
-        let styled = runs.is_some_and(|runs| {
-            runs.iter().any(|r| {
-                !r["text"]["link"].is_null()
-                    || !r["href"].is_null()
-                    || r["annotations"].as_object().is_some_and(|a| {
-                        a.iter().any(|(k, v)| {
-                            if k == "color" {
-                                v.as_str().is_some_and(|s| s != "default")
-                            } else {
-                                v.as_bool() == Some(true)
-                            }
-                        })
-                    })
+        let table_cells = (block_type == "table_row")
+            .then(|| {
+                body["cells"]
+                    .as_array()
+                    .map(|cells| cells.iter().map(TableCell::from_value).collect::<Vec<_>>())
             })
-        });
-        let protected = runs.is_some_and(|runs| runs.iter().any(|r| r["type"] != "text"));
+            .flatten();
+        let styled = runs.is_some_and(|runs| runs.iter().any(styled_run))
+            || table_cells
+                .as_ref()
+                .is_some_and(|cells| cells.iter().any(|cell| cell.styled));
+        let protected = runs.is_some_and(|runs| runs.iter().any(|r| r["type"] != "text"))
+            || table_cells
+                .as_ref()
+                .is_some_and(|cells| cells.iter().any(|cell| cell.input.is_none()));
         Self {
             id: value["id"].as_str().unwrap_or_default().to_owned(),
             modified: value["last_edited_time"]
@@ -140,9 +204,19 @@ impl BlockItem {
             block_type,
             text,
             rich_text,
+            table_cells,
             styled,
             protected,
         }
+    }
+
+    pub fn editable_table_row(&self) -> bool {
+        self.block_type == "table_row"
+            && !self.protected
+            && self
+                .table_cells
+                .as_ref()
+                .is_some_and(|cells| !cells.is_empty())
     }
 
     pub fn label(&self, number: usize, depth: usize) -> BlockLabel {
@@ -290,6 +364,32 @@ pub fn update_payload(block: &BlockItem, text: Option<&str>) -> Value {
     json!({block.block_type.clone(): fields})
 }
 
+pub fn table_row_payload(block: &BlockItem, texts: &[String]) -> Result<Value, &'static str> {
+    if !block.editable_table_row() {
+        return Err("This table row contains unsupported content or has no cells");
+    }
+    let cells = block.table_cells.as_ref().unwrap();
+    if cells.len() != texts.len() {
+        return Err("Table row cell count changed; cancel and refresh before editing again");
+    }
+    if texts.iter().map(|text| text.chars().count()).sum::<usize>() > 100_000 {
+        return Err("Text is limited to 100,000 characters per block");
+    }
+    let cells = cells
+        .iter()
+        .zip(texts)
+        .map(|(cell, text)| {
+            if cell.text == *text {
+                serde_json::to_value(cell.input.as_ref().unwrap())
+                    .map_err(|_| "Could not preserve original cell formatting")
+            } else {
+                Ok(rich_text(text))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({"table_row":{"cells":cells}}))
+}
+
 pub fn append_payload(kind: Kind, text: &str, after: Option<&str>) -> Value {
     let mut fields = json!({"rich_text": rich_text(text)});
     if kind == Kind::Todo {
@@ -312,6 +412,89 @@ pub(crate) mod tests {
             &json!({"id":"block", "type":"paragraph", "last_edited_time":"before",
             "paragraph":{"rich_text":[{"type":"text","plain_text":"Hello","text":{"content":"Hello"}}]}}),
         )
+    }
+
+    pub fn table_row() -> BlockItem {
+        BlockItem::from_value(
+            &json!({"id":"block", "type":"table_row", "last_edited_time":"2026-01-01T00:00:00Z",
+            "table_row":{"cells":[
+                [{"type":"text","plain_text":"left │ side\n你好","text":{"content":"left │ side\n你好"}}],
+                [{"type":"text","plain_text":"Styled","href":"https://example.com/","text":{"content":"Styled","link":{"url":"https://example.com/"}},"annotations":{"bold":true,"italic":true,"underline":true,"strikethrough":true,"code":true,"color":"red"}},
+                 {"type":"text","plain_text":" tail","text":{"content":" tail"}}],
+                []
+            ]}}),
+        )
+    }
+
+    #[test]
+    fn table_rows_keep_cell_boundaries_and_only_write_input_fields() {
+        let row = table_row();
+        let cells = row.table_cells.as_ref().unwrap();
+        assert!(row.editable_table_row());
+        assert!(row.styled);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0].text, "left │ side\n你好");
+        assert_eq!(row.text, "left │ side\n你好 │ Styled tail │ ");
+        assert!(row.rich_text.iter().any(|run| run.url.is_some()));
+        let mut texts = cells
+            .iter()
+            .map(|cell| cell.text.clone())
+            .collect::<Vec<_>>();
+        texts[0] = "new\n🦀 │ text".into();
+        let payload = table_row_payload(&row, &texts).unwrap();
+        assert_eq!(
+            payload,
+            json!({"table_row":{"cells":[
+                [{"type":"text","text":{"content":"new\n🦀 │ text"}}],
+                [{"type":"text","text":{"content":"Styled","link":{"url":"https://example.com/"}},"annotations":{"bold":true,"italic":true,"underline":true,"strikethrough":true,"code":true,"color":"red"}},
+                 {"type":"text","text":{"content":" tail"}}], []
+            ]}})
+        );
+        texts[1] = "plain".into();
+        assert_eq!(
+            table_row_payload(&row, &texts).unwrap()["table_row"]["cells"][1],
+            rich_text("plain")
+        );
+        texts.pop();
+        assert!(table_row_payload(&row, &texts).is_err());
+    }
+
+    #[test]
+    fn unsupported_or_malformed_table_rows_are_read_only() {
+        for cells in [
+            json!([]),
+            json!(null),
+            json!([null]),
+            json!([[{"type":"mention","plain_text":"@person","mention":{"type":"user"}}]]),
+            json!([[{"type":"equation","plain_text":"x","equation":{"expression":"x"}}]]),
+            json!([[{"type":"future","plain_text":"future"}]]),
+            json!([[{"type":"text","plain_text":"missing content"}]]),
+        ] {
+            let row =
+                BlockItem::from_value(&json!({"type":"table_row","table_row":{"cells":cells}}));
+            assert!(!row.editable_table_row());
+            assert!(table_row_payload(&row, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn table_row_chunks_unicode_and_preserves_empty_cells() {
+        let row = table_row();
+        let texts = vec!["🦀".repeat(4001), "".into(), "".into()];
+        let payload = table_row_payload(&row, &texts).unwrap();
+        let chunks = payload["table_row"]["cells"][0].as_array().unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[0]["text"]["content"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            2000
+        );
+        assert_eq!(payload["table_row"]["cells"][1], json!([]));
+        assert_eq!(payload["table_row"]["cells"][2], json!([]));
+        assert!(table_row_payload(&row, &["x".repeat(100_001), "".into(), "".into()]).is_err());
     }
 
     #[test]
