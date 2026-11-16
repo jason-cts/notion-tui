@@ -16,6 +16,51 @@ fn data(kind: &str, mode: Value, values: Vec<Value>) -> DatabaseData {
 fn today() -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 11, 11).unwrap()
 }
+
+#[test]
+fn table_cursor_follows_display_order_including_repeated_pages() {
+    let mut d = data(
+        "multi_select",
+        Value::Null,
+        vec![
+            json!([{"id":"b","name":"Beta"},{"id":"a","name":"Alpha"}]),
+            json!([{"id":"a","name":"Alpha"}]),
+        ],
+    );
+    d.view.view_type = "table".into();
+    let order: Vec<_> = d.table_rows().iter().map(|r| r.row).collect();
+    assert_eq!(order, [0, 1, 0]);
+    let mut state = DatabaseState {
+        data: Some(d),
+        ..Default::default()
+    };
+    state.move_horizontal(false);
+    assert_eq!(state.table_cell, 0);
+    state.move_horizontal(true);
+    state.move_horizontal(true);
+    assert_eq!(state.table_cell, 1);
+    state.move_vertical(true);
+    assert_eq!(
+        (state.table_row, state.selected, state.table_cell),
+        (1, 1, 1)
+    );
+    state.move_vertical(true);
+    assert_eq!((state.table_row, state.selected), (2, 0));
+    state.move_vertical(true);
+    assert_eq!(state.table_row, 2);
+    state.move_edge(false);
+    assert_eq!(
+        (state.table_row, state.selected, state.table_cell),
+        (0, 0, 1)
+    );
+    state.move_vertical(false);
+    state.move_edge(true);
+    assert_eq!((state.table_row, state.selected), (2, 0));
+    state.data.as_mut().unwrap().rows.clear();
+    state.move_vertical(true);
+    state.move_edge(true);
+    assert!(state.selected_row().is_none());
+}
 fn labels(data: &DatabaseData) -> Vec<String> {
     data.groups(today())
         .iter()

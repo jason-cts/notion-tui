@@ -59,14 +59,14 @@ try:
     wait_for("Welcome to Notion TUI")
     send("\r")
     wait_for("Your workspace")
-    send("Gk")
+    send("G\x1b[A")
     wait_for("child_database (list)")
     wait_for("Task database  ›")
     send("\r")
     wait_for("Alpha")
     send("]")
     wait_for("To do (1)")
-    send("l\r")
+    send("\x1b[C\r")
     wait_for("Your workspace")
     send("\x7f")
     wait_for("In progress (1)")
@@ -77,14 +77,35 @@ try:
     send("]")
     wait_for("child_database (table)")
     wait_for("Alpha")
+    # Property Enter stays in the table; e opens the cell editor.
+    send("\x1b[C\r")
+    wait_for("child_database (table)")
+    send("e")
+    wait_for("EDIT CELL")
+    send("\x13")  # unchanged title closes without a write
+    wait_for("child_database (table)")
+    send("\x1b[C\x1b[Ce")
+    wait_for("EDIT CELL")
+    send("/edited\x13")
+    wait_for("Demo is read-only")
+    send("\x1b")
+    wait_for("Discard this draft?")
+    send("y")
+    wait_for("child_database (table)")
+    # Left navigates to the icon; only its Enter opens the page.
+    send("\x1b[D" * 3 + "\r")
+    wait_for("Your workspace")
+    send("\x7f")
+    wait_for("child_database (table)")
+    wait_for("Alpha")
     send("a")
-    wait_for("Database browsing is read-only")
+    wait_for("Use e to edit a property cell")
     send("[")
     wait_for("To do (1)")
-    for back in ["\x1b[D", "\x7f", "\x08"]:
+    for back in ["\x7f", "\x08"]:
         send(back)
         wait_for("Your workspace")
-        send("Gk\r")
+        send("G\x1b[A\r")
         wait_for("To do (1)")
     size[:] = [12, 45]
     resize()
@@ -92,7 +113,7 @@ try:
     send("q")
     assert process.wait(timeout=10) == 0
     assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
-    print("Database PTY smoke passed: list, board, table, child indicator, Left/DEL/BS parent navigation, narrow layout")
+    print("Database PTY smoke passed: list, board, table, child indicator, cell editing, icon page navigation, DEL/BS parent navigation, narrow layout")
 finally:
     if process.poll() is None:
         process.kill()

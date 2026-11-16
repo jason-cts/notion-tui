@@ -190,6 +190,15 @@ impl App {
         }
         match result {
             Ok(data) => {
+                let old_occurrence = db
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.table_rows().get(db.table_row).cloned());
+                let old_property = db.data.as_ref().and_then(|d| {
+                    db.table_cell
+                        .checked_sub(1)
+                        .and_then(|i| d.columns().get(i).map(|c| c.id.clone()))
+                });
                 let selected = db.selected_row().map(|r| r.id.clone());
                 let old_group = db.data.as_ref().and_then(|d| {
                     d.groups(rusticnotion::chrono::Local::now().date_naive())
@@ -197,7 +206,8 @@ impl App {
                         .map(|g| g.key.clone())
                 });
                 db.selected = selected
-                    .and_then(|id| data.rows.iter().position(|r| r.id == id))
+                    .as_ref()
+                    .and_then(|id| data.rows.iter().position(|r| &r.id == id))
                     .unwrap_or(0);
                 let groups = data.groups(rusticnotion::chrono::Local::now().date_naive());
                 db.column = old_group
@@ -216,10 +226,44 @@ impl App {
                     .get(db.column)
                     .and_then(|g| g.cards.iter().position(|c| c.row == db.selected))
                     .unwrap_or(0);
+                if data.view.view_type == "table" {
+                    let rows = data.table_rows();
+                    db.table_row = rows
+                        .iter()
+                        .position(|r| {
+                            selected
+                                .as_ref()
+                                .is_some_and(|id| data.rows[r.row].id == *id)
+                                && old_occurrence.as_ref().is_some_and(|old| {
+                                    old.group == r.group && old.subgroup == r.subgroup
+                                })
+                        })
+                        .or_else(|| {
+                            rows.iter().position(|r| {
+                                selected
+                                    .as_ref()
+                                    .is_some_and(|id| data.rows[r.row].id == *id)
+                            })
+                        })
+                        .unwrap_or(db.table_row.min(rows.len().saturating_sub(1)));
+                    db.selected = rows.get(db.table_row).map_or(0, |r| r.row);
+                    db.table_cell = old_property
+                        .and_then(|id| {
+                            data.columns()
+                                .iter()
+                                .position(|c| crate::database::same_property_id(&c.id, &id))
+                        })
+                        .map_or(0, |i| i + 1);
+                }
                 if active {
                     self.status = format!(
-                        "{} rows · [ / ] views · Enter open · v details",
-                        data.rows.len()
+                        "{} rows · [ / ] views · {} · v details",
+                        data.rows.len(),
+                        if data.view.view_type == "table" {
+                            "arrows cells · e edit · Enter icon opens page"
+                        } else {
+                            "Enter open"
+                        }
                     );
                     self.error = false;
                 }
@@ -252,13 +296,45 @@ impl App {
                     db.selected = 0;
                     db.column = 0;
                     db.card = 0;
-                    db.horizontal = 0;
+                    db.table_cell = 0;
+                    db.table_row = 0;
                     db.data = None;
                     self.load_database(false);
                 }
             }
             KeyCode::Char('r') => self.load_database(true),
-            KeyCode::Char('e' | 'd' | 'a' | 'n' | ' ') => self
+            KeyCode::Char('e') if self.database().is_some_and(DatabaseState::is_table) => {
+                if self.loading_content {
+                    return true;
+                }
+                let target = self.database().and_then(|db| {
+                    let data = db.data.as_ref()?;
+                    let row = db.selected_row()?;
+                    let Some(column) = db
+                        .table_cell
+                        .checked_sub(1)
+                        .and_then(|i| data.columns().get(i).cloned())
+                    else {
+                        return Some(Err(
+                            "Select a property cell to edit; Enter on the icon opens the page",
+                        ));
+                    };
+                    Some(crate::editor::CellTarget::new(data, row, column))
+                });
+                match target {
+                    Some(Ok(target)) => {
+                        self.editor = Some(Editor::new(Target::DatabaseCell(Box::new(target))))
+                    }
+                    Some(Err(error)) => self.fail(error),
+                    None => {}
+                }
+            }
+            KeyCode::Char('d' | 'a' | 'A' | 'n' | ' ')
+                if self.database().is_some_and(DatabaseState::is_table) =>
+            {
+                self.fail("This table command is unavailable. Use e to edit a property cell or Enter on its page icon");
+            }
+            KeyCode::Char('e' | 'd' | 'a' | 'A' | 'n' | ' ') => self
                 .fail("Database browsing is read-only. Enter opens a page for editing its content"),
             KeyCode::Char('v' | 'o') => {
                 let detail = self
@@ -277,16 +353,16 @@ impl App {
                     }
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 self.databases.get_mut(&id).unwrap().move_vertical(true);
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 self.databases.get_mut(&id).unwrap().move_vertical(false);
             }
-            KeyCode::Char('h') => {
+            KeyCode::Left => {
                 self.databases.get_mut(&id).unwrap().move_horizontal(false);
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right => {
                 self.databases.get_mut(&id).unwrap().move_horizontal(true);
             }
             KeyCode::Home | KeyCode::Char('g') => {
@@ -297,7 +373,11 @@ impl App {
                 db.move_edge(true);
             }
             KeyCode::Enter => {
-                if self.loading_content {
+                if self.loading_content
+                    || self
+                        .database()
+                        .is_some_and(|db| db.is_table() && db.table_cell != 0)
+                {
                     return true;
                 }
                 if let Some(row) = self

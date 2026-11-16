@@ -69,31 +69,31 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 
 | Key | Action |
 | --- | --- |
-| ↑/↓ or `j`/`k` | Select a page or block |
+| ↑/↓ | Select a page or block |
 | `g`/`G`, Home/End | First/last item |
 | Tab | Switch pages/content panes |
 | Enter | Open a page or a block's children |
 | Backspace | Return to parent |
-| ← | Return to parent, including from a database |
 | `[` / `]` | Previous/next saved database view |
-| `h`/`l` | Move between board columns or scroll table columns; → also moves right |
+| ←/→ | Move between board columns or database table cells |
 | `/` | Search page titles; Enter submits, Esc cancels |
 | `r` | Refresh the focused pane |
 | `v` | Open the full block in a scrollable reader |
 | `o` | Open the selected block's external link in your browser; choose when it contains multiple links |
-| `e` | Edit a paragraph, heading, list item, to-do, or simple-table row |
+| `e` | Edit a paragraph, heading, list item, to-do, simple-table row, or selected database property |
 | `d` | Delete the selected block after confirmation |
 | Space | Toggle a to-do without changing its rich text |
 | `a` | Insert a block immediately after the selected block; create the first block in an empty location |
+| Shift+A | Insert a block immediately before the selected block; create the first block in an empty location |
 | `n` | Create a child of the current page, including when viewing nested blocks |
 | `?` | Keyboard help |
 | `q` / Ctrl-C | Quit |
 
-The editor supports multiline text, Unicode, bracketed paste, arrows, and Home/End. Tab cycles the type of an inserted block: paragraph, three heading levels, bullet, numbered item, or to-do. Ctrl-S saves; Esc asks before discarding the draft. In the full-block reader and help, ↑/↓ or `j`/`k` scroll and PageUp/PageDown move ten lines. In the reader, `o` opens its external links; another key closes it.
+The editor supports multiline text, Unicode, bracketed paste, arrows, and Home/End. Tab cycles the type of an inserted block: paragraph, three heading levels, bullet, numbered item, or to-do. Ctrl-S saves; Esc asks before discarding the draft. In the full-block reader and help, ↑/↓ scroll and PageUp/PageDown move ten lines. In the reader, `o` opens its external links; another key closes it.
 
-Insertion stays at the current nesting level, directly after the block selected when you pressed `a`. Saving refreshes the list and selects the block just after that anchor. Failed saves retain the draft and its insertion point.
+Insertion stays at the current nesting level: `a` inserts directly after the selected block, and Shift+A inserts directly before it. Both shortcuts create the first block in an empty location. Saving refreshes the list and selects the inserted block. Failed saves retain the draft and its insertion point.
 
-Press `d` in a content-block list to review the selected block's type and text/title, then `y` to delete or `n`/Esc to cancel. Enter does not confirm. All block types can be deleted, including child pages, child databases, and containers with their contents. Deletion moves the block to Notion Trash, where it can be restored. Page search results and database records remain read-only. After deletion, the next block is selected, or the previous block when deleting the last item.
+Press `d` in a content-block list to review the selected block's type and text/title, then `y` to delete or `n`/Esc to cancel. Enter does not confirm. All block types can be deleted, including child pages, child databases, and containers with their contents. Deletion moves the block to Notion Trash, where it can be restored. Page search results and database records cannot be deleted from these panes. After deletion, the next block is selected, or the previous block when deleting the last item.
 
 Notion bold, italic, underline, and strikethrough annotations render as terminal styles, including combined styles within a block. Wrapping and the full-block reader preserve these spans. Exact appearance depends on your terminal and font. HTTP/HTTPS links appear cyan and underlined and emit OSC 8 hyperlinks for terminals that support clicking them. Use your terminal's usual link-opening gesture, or press `o` to launch the default browser. For a block with several targets, use ↑/↓ and Enter in the link chooser; Esc cancels. Browsing content alone never launches a browser.
 
@@ -103,9 +103,15 @@ Consecutive numbered-list siblings count upward and restart after another block 
 
 Selecting a child database loads its saved view metadata and shows the layout in the content title, for example `child_database (list)`. Enter opens the database. The first supported saved view is selected initially; `[` and `]` switch views and the choice is remembered for this session. Each view uses its own data source, saved filters, and saved sorts through Notion's Views API.
 
-List views show page titles and visible properties. Tables preserve saved column order, visibility, wrapping, and frozen columns, with widths adapted to terminal cells. Boards show grouped cards, counts, visible properties, and subgroup sections. Use Up/Down or `j`/`k` to select rows/cards, and `h`/`l` to navigate board columns or scroll a table. Enter opens the selected page; Left or Backspace returns to the parent, including from the database itself. Returning from a row page restores its database selection. `v` opens row details, `o` opens external links, and `r` refreshes metadata and rows. Database screens are read-only; existing content-editing commands work after opening a page.
+List views show page titles and visible properties. Boards show grouped cards, counts, visible properties, and subgroup sections. Use Up/Down to select rows/cards, and Left/Right to navigate board columns. Enter opens the selected page; Backspace returns to the parent.
 
-Grouping supports status groups/options, select, multi-select, checkbox, people, creator/editor, relations, text/prefixes, numbers/ranges, dates, and formula results. Multi-valued properties can show the same page in several groups. Missing values appear under **No value**. Date grouping uses the terminal's local timezone and the saved week start. Manual group ordering uses schema order when available and first-seen query order otherwise; a notice explains where ordering can differ from Notion's web UI. Sub-items are displayed as flat rows, and image covers are omitted. Other view layouts remain selectable with an unsupported-layout message. Unknown future grouping types fall back to a list with a notice.
+Tables preserve saved column order, visibility, wrapping, and frozen columns, with widths adapted to terminal cells. A pinned icon cell at the left of each row shows its page emoji, or `📄` when none is available. Arrow keys select one cell at a time, starting at the first row's icon. Enter opens a row's page only from its icon; `e` edits a selected property. Backspace returns to the parent. `<` and `>` at the property header's edges indicate more columns to the left or right. The viewport follows the cursor and releases frozen property columns on narrow terminals. Returning from a row page restores the selected row and cell.
+
+Editable table properties are title, rich text, number, checkbox, select, status, multi-select, date, URL, email, and phone. Text uses the multiline editor; changing styles or links requires confirmation before replacing them with plain text. Mentions, equations, and unrecognized rich text remain read-only. Choice editors use existing options only: Up/Down selects an option and Space/Enter chooses or toggles it. Select can be cleared; resetting status uses Notion's default option. Date editing uses Tab/Shift-Tab for start, optional end, and optional IANA timezone; Ctrl-D clears the date. Use `YYYY-MM-DD`, an ISO timestamp with an offset, or a local ISO timestamp without an offset when specifying a timezone. Empty text or scalar fields clear their values. Ctrl-S saves; Esc asks before discarding a draft. Other property types and list/board properties remain read-only.
+
+Saving updates only the selected property, checks the page timestamp and property identity/type for conflicts, and reloads the saved query so filtering, sorting, and grouping reflect the change. Selection follows the page and property when they remain visible, otherwise the nearest remaining row is selected. Failed saves retain the draft and cursor; writes are never retried automatically. `v` opens row details, `o` opens external links, and `r` refreshes metadata and rows.
+
+Grouping supports status groups/options, select, multi-select, checkbox, people, creator/editor, relations, text/prefixes, numbers/ranges, dates, and formula results. Multi-valued properties can show the same page in several groups. Missing values appear under **No value**. Date grouping uses the terminal's local timezone and the saved week start. Manual group ordering uses schema order when available and first-seen query order otherwise; a notice explains where ordering can differ from Notion's web UI. Sub-items are displayed as flat rows, and image covers are omitted. Other view layouts remain selectable with an unsupported-layout message. Unknown future grouping types show flat rows with a notice; boards fall back to a list.
 
 Property matching accepts both raw IDs from saved views and percent-encoded IDs from schemas and pages. Status columns follow schema workflow order, and empty card properties are omitted. Column names and row order come from the API. When a view has no saved sort, a notice explains that API row order may differ from the web's manual order.
 
@@ -125,13 +131,13 @@ Editing replaces a block's rich text with plain text. Styled text and links requ
 
 For a simple table, open its children with Enter, select a `table_row`, and press `e`. The row dialog provides one multiline field per cell, including empty cells. Tab and Shift-Tab cycle through cells, Enter inserts a newline, and Ctrl-S saves the whole row. Arrow keys, Home/End, Backspace, and bracketed paste work within the active cell. The dialog scrolls to keep the active cell visible; Esc asks before discarding all cell drafts.
 
-Only changed cells become plain text. Unchanged cells retain their original runs, styles, colors, and links. Changing a styled cell requires confirmation; further text changes require confirmation again. A row containing mentions, equations, or unrecognized rich text cannot be edited. Saving checks the row's timestamp, type, and cell count, preserves empty cells, and restores the selected row after refreshing. Failed saves retain every cell and cursor. Unchanged rows close without a request. Row drafts share the 100,000-character block limit; text runs are split at 2,000 characters. Adding rows or columns, removing columns, and editing database properties are excluded. Use `d` to delete a selected row with confirmation.
+Only changed cells become plain text. Unchanged cells retain their original runs, styles, colors, and links. Changing a styled cell requires confirmation; further text changes require confirmation again. A row containing mentions, equations, or unrecognized rich text cannot be edited. Saving checks the row's timestamp, type, and cell count, preserves empty cells, and restores the selected row after refreshing. Failed saves retain every cell and cursor. Unchanged rows close without a request. Row drafts share the 100,000-character block limit; text runs are split at 2,000 characters. Adding simple-table rows or columns and removing columns are excluded. Database property editing uses the separate cell controls described above. Use `d` to delete a selected row with confirmation.
 
 Before updating a block, the app retrieves its current modification timestamp and rejects a conflicting edit. This is a best-effort check: Notion does not provide an atomic compare-and-update operation, so a change between the check and the save can still race. Failed saves retain the draft and show the error. There are no automatic write retries. If a response is lost, inspect Notion before retrying an append or page creation; the first request may have succeeded. Rate-limit errors show the requested waiting time.
 
 Deletion also checks the block's timestamp and type before sending the request, with the same best-effort limitation. Failed deletions retain the list and selection. Deletions are never retried automatically, including after OAuth renewal; press `d` and confirm again to retry. If the response is unavailable or unreadable, inspect Notion first because deletion may have succeeded. Demo content remains read-only.
 
-Drafts and navigation state live in memory. Quitting discards them. During a save or deletion, wait for the response before quitting. The app uses one API token or one saved OAuth workspace authorization and excludes database property editing, database-record deletion, reordering, offline sync, and whole-page Markdown editing. Both clients use API version `2026-03-11` from rusticnotion's `NOTION_API_VERSION` constant. Insertions use `position.after_block` to retain their selected sibling anchor.
+Drafts and navigation state live in memory. Quitting discards them. During a save or deletion, wait for the response before quitting. The app uses one API token or one saved OAuth workspace authorization and excludes database-record deletion, database schema editing, reordering, offline sync, and whole-page Markdown editing. Both clients use API version `2026-03-11` from rusticnotion's `NOTION_API_VERSION` constant. Insertions use `position.after_block` to retain their sibling anchor, or `position.start` when inserting before the first block.
 
 ## Structure and dependency
 

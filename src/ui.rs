@@ -2,7 +2,7 @@ use crate::{
     app::{App, Confirm, Focus},
     editor::{Buffer, Editor, Target},
     hyperlinks::{self, Links},
-    model::BlockLabel,
+    model::{BlockLabel, InsertPosition},
     rich_text::{self, RichLine, RichRun},
 };
 use ratatui::{
@@ -200,8 +200,9 @@ impl Ui {
         );
         frame.render_widget(
             Paragraph::new(
-                if app.database().is_some() { "[ / ] views  h/l columns  Enter page  ←/Backspace parent  v details  o link  r refresh  q quit" }
-                else { "Tab panes  / search  Enter open  o link  v read  e edit  d delete  a append  ? help  q quit" },
+                if app.database().is_some_and(crate::database::DatabaseState::is_table) { "arrows select cells  e edit  Enter icon opens page  Backspace parent  [ / ] views  < > more columns" }
+                else if app.database().is_some() { "[ / ] views  ←/→ columns  Enter page  Backspace parent  v details  o link  r refresh  q quit" }
+                else { "Tab panes  / search  Enter open  o link  v read  e edit  d delete  a after  A before  ? help  q quit" },
             )
             .style(Style::default().fg(ACCENT)),
             Rect {
@@ -294,15 +295,28 @@ impl Ui {
             );
         }
         if let Some(editor) = &app.editor {
-            if editor.row.is_some() {
+            if editor.cell.is_some() {
+                database::render_cell_editor(frame, editor, app.saving, app.confirm.is_none());
+            } else if editor.row.is_some() {
                 render_row_editor(frame, editor, app.saving, app.confirm.is_none());
             } else {
                 let area = popup(area, 100, frame.area().height.saturating_sub(4).min(30));
                 frame.render_widget(Clear, area);
                 let name = match &editor.target {
                     Target::Edit(_) => "EDIT BLOCK",
-                    Target::Append { after: Some(_), .. } => "APPEND BLOCK · after selected block",
-                    Target::Append { after: None, .. } => "APPEND BLOCK · first block",
+                    Target::DatabaseCell(_) => unreachable!("cell editor rendered separately"),
+                    Target::Append {
+                        position: InsertPosition::Start,
+                        ..
+                    } => "INSERT BLOCK · at beginning",
+                    Target::Append {
+                        position: InsertPosition::After(_),
+                        ..
+                    } => "INSERT BLOCK",
+                    Target::Append {
+                        position: InsertPosition::End,
+                        ..
+                    } => "INSERT BLOCK · first block",
                     Target::Create(_) => "NEW CHILD PAGE",
                 };
                 frame.render_widget(
@@ -327,7 +341,7 @@ impl Ui {
                 let hint = editor
                     .error
                     .as_deref()
-                    .unwrap_or("Ctrl-S save · Esc cancel · Tab changes appended block type");
+                    .unwrap_or("Ctrl-S save · Esc cancel · Tab changes inserted block type");
                 frame.render_widget(
                     Paragraph::new(clean(hint))
                         .wrap(Wrap { trim: false })
@@ -410,7 +424,7 @@ impl Ui {
             self.block_offset = 0;
             frame.render_widget(Paragraph::new(if app.loading_content { "\n  Loading content…" } else if app.path.is_empty() {
                 "\n  Open a page to get started.\n\n  / search your workspace\n  Enter opens a page\n  ? shows all keyboard shortcuts"
-            } else { "\n  No blocks here.\n\n  a append a block · n create a child page" }).block(block).wrap(Wrap { trim: false }), area);
+            } else { "\n  No blocks here.\n\n  a/A insert a block · n create a child page" }).block(block).wrap(Wrap { trim: false }), area);
             return;
         }
         frame.render_widget(block, area);
@@ -481,27 +495,33 @@ impl Ui {
         frame.render_widget(Clear, area);
         let text = concat!(
             "\n  NAVIGATE\n",
-            "  ↑/↓ or j/k    Move selection       g/G      First/last\n",
-            "  Tab           Switch panes         Enter    Open page/children\n  [ / ]         Database views       h/l      Columns / table scroll\n",
-            "  ←/Backspace   Back to parent        /        Search page titles\n",
+            "  ↑/↓           Move selection       g/G      First/last\n",
+            "  Tab           Switch panes         Enter    Open page/children\n  [ / ]         Database views       ←/→      Board columns / table cells\n",
+            "  Backspace     Back to parent\n",
+            "  /             Search page titles\n",
+            "  TABLE VIEWS   Arrow keys select a single cell\n",
+            "  Enter         Open page from its icon; e edits a property\n",
+            "  < / >         More property columns to the left / right\n",
             "  r             Refresh focused pane v        Read full block\n",
             "  o             Open selected block's link in your browser\n",
             "  q / Ctrl-C    Quit                 ?        Help\n\n",
             "  EDIT\n",
-            "  e             Edit selected text block or table row\n",
+            "  e             Edit selected text block, table row, or database cell\n",
             "  d             Delete selected block (confirm with y)\n",
             "  Space         Toggle selected to-do\n",
-            "  a             Insert a block after the selected block\n",
+            "  a / Shift+A   Insert a block after / before the selected block\n",
             "  n             Create a child of the current page\n",
             "  Ctrl-S        Save draft            Esc      Cancel draft\n",
-            "  Tab           Choose appended block type\n",
+            "  Tab           Choose inserted block type\n",
             "  Tab/Shift-Tab Move between table-row cells\n",
+            "  CELL PICKERS  ↑/↓ choose; Space/Enter select; Ctrl-S save\n",
+            "  DATE CELLS    Tab/Shift-Tab fields; Ctrl-D clears the date\n",
             "  Arrows/Home/End move the text cursor; Enter inserts a newline.\n\n",
             "  Styled text requires confirmation before replacement.\n",
             "  Mentions, equations, and unsupported types cannot be edited.\n",
             "  Deleting a container includes its contents; restore in Notion Trash.\n",
             "  A failed save keeps your draft. Check Notion before retrying.\n\n",
-            "  ↑/↓ or j/k scroll · PageUp/PageDown move ten lines\n",
+            "  ↑/↓        scroll · PageUp/PageDown move ten lines\n",
             "  Any other key closes help."
         );
         frame.render_widget(
@@ -520,6 +540,14 @@ fn render_confirmation(frame: &mut Frame, app: &App) {
             Confirm::Delete => {
                 render_delete_confirmation(frame, app);
                 return;
+            }
+            Confirm::Formatting
+                if app
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.cell.is_some()) =>
+            {
+                "Saving replaces this cell's styles and links with plain text.\nOther properties are preserved.\n\nContinue? y / n"
             }
             Confirm::Formatting
                 if app
@@ -818,7 +846,7 @@ mod tests {
             }
             app.editor = Some(crate::editor::Editor::new(Target::Append {
                 parent: "p".into(),
-                after: None,
+                position: InsertPosition::End,
             }));
             app.editor
                 .as_mut()

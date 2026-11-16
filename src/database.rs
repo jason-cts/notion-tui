@@ -41,7 +41,9 @@ pub struct DatabaseState {
     pub selected: usize,
     pub column: usize,
     pub card: usize,
-    pub horizontal: usize,
+    /// Table cursor: displayed row occurrence and cell (0 is the page icon).
+    pub table_row: usize,
+    pub table_cell: usize,
     pub progress: usize,
     pub error: Option<String>,
     pub generation: u64,
@@ -70,8 +72,36 @@ pub struct Group {
     pub subgroups: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TableRow {
+    pub row: usize,
+    pub group: String,
+    pub subgroup: String,
+    pub label: String,
+}
+
 impl DatabaseState {
+    pub fn is_table(&self) -> bool {
+        self.view().is_some_and(|v| v.view_type == "table")
+            || self
+                .data
+                .as_ref()
+                .is_some_and(|d| d.view.view_type == "table")
+    }
+
+    fn select_table_row(&mut self, position: usize) {
+        let Some(data) = &self.data else { return };
+        let rows = data.table_rows();
+        self.table_row = position.min(rows.len().saturating_sub(1));
+        self.selected = rows.get(self.table_row).map_or(0, |r| r.row);
+    }
+
     pub fn move_edge(&mut self, last: bool) {
+        if self.is_table() {
+            let len = self.data.as_ref().map_or(0, |d| d.table_rows().len());
+            self.select_table_row(if last { len.saturating_sub(1) } else { 0 });
+            return;
+        }
         let Some(data) = &self.data else {
             return;
         };
@@ -105,6 +135,14 @@ impl DatabaseState {
         self.data.as_ref()?.rows.get(self.selected)
     }
     pub fn move_vertical(&mut self, down: bool) {
+        if self.is_table() {
+            self.select_table_row(if down {
+                self.table_row.saturating_add(1)
+            } else {
+                self.table_row.saturating_sub(1)
+            });
+            return;
+        }
         let Some(data) = &self.data else { return };
         if data.view.view_type == "board" && !self.flat_group_fallback() {
             let groups = data.groups(Local::now().date_naive());
@@ -128,6 +166,14 @@ impl DatabaseState {
     }
     pub fn move_horizontal(&mut self, right: bool) {
         let Some(data) = &self.data else { return };
+        if self.is_table() {
+            self.table_cell = if right {
+                self.table_cell.saturating_add(1).min(data.columns().len())
+            } else {
+                self.table_cell.saturating_sub(1)
+            };
+            return;
+        }
         if data.view.view_type == "board" && !self.flat_group_fallback() {
             let groups = data.groups(Local::now().date_naive());
             let card = self.card;
@@ -148,13 +194,6 @@ impl DatabaseState {
                     self.card = 0;
                 }
             }
-        } else {
-            let columns = data.columns();
-            self.horizontal = if right {
-                (self.horizontal + 1).min(columns.len().saturating_sub(1))
-            } else {
-                self.horizontal.saturating_sub(1)
-            };
         }
     }
 }
@@ -255,6 +294,43 @@ pub fn plain(value: &Value, labels: &HashMap<String, String>) -> String {
 }
 
 impl DatabaseData {
+    pub fn table_rows(&self) -> Vec<TableRow> {
+        if self
+            .notices
+            .iter()
+            .any(|n| n.starts_with("Unsupported grouping"))
+        {
+            return (0..self.rows.len())
+                .map(|row| TableRow {
+                    row,
+                    group: String::new(),
+                    subgroup: String::new(),
+                    label: String::new(),
+                })
+                .collect();
+        }
+        let grouped = self
+            .view
+            .configuration
+            .as_ref()
+            .is_some_and(|c| c.group_by.is_some());
+        self.groups(Local::now().date_naive())
+            .into_iter()
+            .flat_map(|g| {
+                g.cards.into_iter().map(move |c| TableRow {
+                    row: c.row,
+                    group: g.key.clone(),
+                    subgroup: c.subgroup_key,
+                    label: if grouped {
+                        g.label.clone()
+                    } else {
+                        String::new()
+                    },
+                })
+            })
+            .collect()
+    }
+
     pub fn columns(&self) -> Vec<Column> {
         let schema = self.schema["properties"]
             .as_object()
@@ -439,7 +515,7 @@ impl DatabaseData {
         }
         groups
     }
-    fn schema_property(&self, id: &str) -> &Value {
+    pub fn schema_property(&self, id: &str) -> &Value {
         self.schema["properties"]
             .as_object()
             .and_then(|p| {

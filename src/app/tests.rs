@@ -116,7 +116,7 @@ async fn deletion_confirmation_captures_the_target_and_isolates_input() {
     assert_eq!(app.pending_delete.as_ref().unwrap().parent, "page");
     for key in [
         KeyCode::Enter.into(),
-        KeyCode::Char('j').into(),
+        KeyCode::Down.into(),
         KeyCode::Tab.into(),
         KeyCode::Char('q').into(),
         KeyCode::Char('e').into(),
@@ -135,7 +135,7 @@ async fn deletion_confirmation_captures_the_target_and_isolates_input() {
     app.key(KeyCode::Char('Y').into());
     assert!(app.confirm.is_none());
     assert!(app.saving);
-    for key in [KeyCode::Char('q'), KeyCode::Char('j'), KeyCode::Char('d')] {
+    for key in [KeyCode::Char('q'), KeyCode::Down, KeyCode::Char('d')] {
         app.key(key.into());
     }
     assert!(!app.quit);
@@ -298,10 +298,9 @@ async fn child_database_opens_switches_views_and_restores_row_after_page_navigat
 }
 
 #[tokio::test]
-async fn left_and_both_backspace_encodings_return_from_every_database_layout() {
+async fn only_backspace_returns_to_parent_in_database_views() {
     for (view_index, layout) in ["list", "board", "table"].into_iter().enumerate() {
         for back in [
-            KeyCode::Left.into(),
             KeyCode::Backspace.into(),
             KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
         ] {
@@ -317,6 +316,34 @@ async fn left_and_both_backspace_encodings_return_from_every_database_layout() {
                 drain_content(&mut app, &mut rx).await;
             }
             assert_eq!(app.database().unwrap().view().unwrap().view_type, layout);
+            let selected = app.database().unwrap().selected;
+            for key in ['h', 'j', 'k', 'l'] {
+                app.key(KeyCode::Char(key).into());
+            }
+            let db = app.database().unwrap();
+            assert_eq!(
+                (db.selected, db.column, db.card, db.table_cell, db.table_row),
+                (selected, 0, 0, 0, 0)
+            );
+            if layout == "board" {
+                app.key(KeyCode::Right.into());
+                assert_eq!(app.database().unwrap().column, 1);
+                app.key(KeyCode::Left.into());
+                assert_eq!(app.database().unwrap().column, 0);
+            }
+            for action in ['a', 'A'] {
+                app.key(KeyCode::Char(action).into());
+                assert!(app.editor.is_none());
+                assert!(app.error);
+            }
+            if layout == "table" {
+                app.key(KeyCode::Right.into());
+                assert_eq!(app.database().unwrap().table_cell, 1);
+                app.key(KeyCode::Left.into());
+                assert_eq!(app.database().unwrap().table_cell, 0);
+            }
+            app.key(KeyCode::Left.into());
+            assert_eq!(app.path.len(), 2);
             app.key(back);
             assert_eq!(app.path.len(), 1, "{layout}: {back:?}");
             assert_eq!(app.location().unwrap().id, "page");
@@ -327,6 +354,219 @@ async fn left_and_both_backspace_encodings_return_from_every_database_layout() {
             assert!(!app.blocks.is_empty());
         }
     }
+}
+
+struct CellService {
+    data: std::sync::Mutex<DatabaseData>,
+    fail: std::sync::atomic::AtomicBool,
+    writes: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::service::NotionService for CellService {
+    async fn search(&self, _: &str) -> anyhow::Result<Vec<PageItem>> {
+        Ok(vec![])
+    }
+    async fn page(&self, id: &str) -> anyhow::Result<PageItem> {
+        Ok(PageItem {
+            id: id.into(),
+            title: "Page".into(),
+        })
+    }
+    async fn children(&self, _: &str) -> anyhow::Result<Vec<BlockItem>> {
+        Ok(vec![])
+    }
+    async fn database_rows(
+        &self,
+        _: &rusticnotion::models::view::View,
+        _: crate::service::Progress,
+    ) -> anyhow::Result<DatabaseData> {
+        Ok(self.data.lock().unwrap().clone())
+    }
+    async fn write(&self, write: Write) -> anyhow::Result<Option<PageItem>> {
+        use std::sync::atomic::Ordering;
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            anyhow::bail!("Save failed; draft retained");
+        }
+        let Write::UpdateDatabaseCell { original, value } = write else {
+            panic!("expected database cell");
+        };
+        let mut data = self.data.lock().unwrap();
+        let row = data
+            .rows
+            .iter_mut()
+            .find(|r| r.id == original.row.id)
+            .unwrap();
+        row.page["properties"][&original.column.name][&original.kind] = value;
+        if original.kind == "title" {
+            row.title =
+                crate::database::plain(&row.page["properties"]["Name"], &Default::default());
+            data.rows.sort_by_key(|r| r.title.clone());
+        }
+        data.rows
+            .retain(|r| r.page["properties"]["Status"]["status"]["id"] != "done");
+        Ok(None)
+    }
+}
+
+fn cell_app() -> (App, mpsc::UnboundedReceiver<Message>, Arc<CellService>) {
+    let meta = crate::service::database::demo_metadata("db");
+    let data = crate::service::database::demo_data(meta.views[2].clone());
+    let service = Arc::new(CellService {
+        data: std::sync::Mutex::new(data.clone()),
+        fail: false.into(),
+        writes: 0.into(),
+    });
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(service.clone(), tx, false);
+    app.path.push(Location {
+        id: "db".into(),
+        title: "DB".into(),
+        kind: LocationKind::Database,
+        page_id: "parent".into(),
+        list_depth: 0,
+    });
+    app.focus = Focus::Content;
+    app.databases.insert(
+        "db".into(),
+        DatabaseState {
+            meta: Some(meta),
+            view_index: 2,
+            data: Some(data),
+            ..Default::default()
+        },
+    );
+    (app, rx, service)
+}
+
+#[tokio::test]
+async fn table_editing_keeps_failed_drafts_and_restores_cells_after_sorted_reload() {
+    use std::sync::atomic::Ordering;
+    let (mut app, mut rx, service) = cell_app();
+    app.key(KeyCode::Char('e').into());
+    assert!(app.editor.is_none());
+    app.key(KeyCode::Right.into());
+    app.key(KeyCode::Enter.into());
+    assert_eq!(app.path.len(), 1);
+    app.key(KeyCode::Char('e').into());
+    app.key(ctrl_s());
+    assert!(app.editor.is_none());
+    assert_eq!(service.writes.load(Ordering::SeqCst), 0);
+    app.key(KeyCode::Char('e').into());
+    let buffer = &mut app.editor.as_mut().unwrap().cell.as_mut().unwrap().fields[0];
+    *buffer = Buffer::new("ZZZ".into());
+    app.key(ctrl_s());
+    assert!(matches!(app.confirm, Some(Confirm::Formatting)));
+    service.fail.store(true, Ordering::SeqCst);
+    app.key(KeyCode::Char('y').into());
+    app.receive(rx.recv().await.unwrap());
+    assert!(!app.saving);
+    assert_eq!(app.editor.as_ref().unwrap().active_buffer().text, "ZZZ");
+    assert_eq!(app.editor.as_ref().unwrap().active_buffer().cursor, 3);
+    service.fail.store(false, Ordering::SeqCst);
+    app.key(ctrl_s());
+    app.receive(rx.recv().await.unwrap());
+    drain_content(&mut app, &mut rx).await;
+    assert!(app.editor.is_none());
+    assert_eq!(
+        app.database().unwrap().selected_row().unwrap().id,
+        "demo-row-0"
+    );
+    assert_eq!(app.database().unwrap().table_row, 1);
+    assert_eq!(app.database().unwrap().table_cell, 1);
+    // Enter opens the page only after navigating back to its icon.
+    app.key(KeyCode::Left.into());
+    app.key(KeyCode::Enter.into());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.location().unwrap().id, "demo-row-0");
+    app.key(KeyCode::Backspace.into());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.database().unwrap().table_row, 1);
+    assert_eq!(app.database().unwrap().table_cell, 0);
+}
+
+#[tokio::test]
+async fn table_editing_requeries_filters_and_can_cancel_a_picker() {
+    let (mut app, mut rx, _) = cell_app();
+    app.key(KeyCode::Right.into());
+    app.key(KeyCode::Right.into());
+    app.key(KeyCode::Char('e').into());
+    app.key(KeyCode::Down.into());
+    app.key(KeyCode::Enter.into());
+    app.key(KeyCode::Esc.into());
+    app.key(KeyCode::Char('n').into());
+    assert!(app.editor.is_some());
+    app.key(KeyCode::Esc.into());
+    app.key(KeyCode::Char('y').into());
+    assert!(app.editor.is_none());
+    app.key(KeyCode::Char('e').into());
+    app.key(KeyCode::Down.into());
+    app.key(KeyCode::Down.into());
+    app.key(KeyCode::Enter.into());
+    app.key(ctrl_s());
+    app.receive(rx.recv().await.unwrap());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.database().unwrap().data.as_ref().unwrap().rows.len(), 1);
+    assert_eq!(
+        app.database().unwrap().selected_row().unwrap().id,
+        "demo-row-1"
+    );
+    assert_eq!(app.database().unwrap().table_cell, 2);
+}
+
+#[test]
+fn table_refresh_restores_group_and_property_identity_and_handles_removed_columns() {
+    let (mut app, _, _) = cell_app();
+    let db = app.databases.get_mut("db").unwrap();
+    let data = db.data.as_mut().unwrap();
+    let mut view = serde_json::to_value(&data.view).unwrap();
+    view["configuration"]["group_by"] =
+        serde_json::json!({"type":"multi_select","property_id":"tags"});
+    data.view = serde_json::from_value(view).unwrap();
+    data.rows[0].page["properties"]["Tags"] = serde_json::json!({"id":"tags","type":"multi_select","multi_select":[{"id":"a","name":"Alpha"},{"id":"b","name":"Beta"}]});
+    db.table_row = 1;
+    db.selected = 0;
+    db.table_cell = 3;
+    let mut refreshed = db.data.as_ref().unwrap().clone();
+    refreshed.rows.reverse();
+    refreshed
+        .view
+        .configuration
+        .as_mut()
+        .unwrap()
+        .properties
+        .as_mut()
+        .unwrap()
+        .swap(0, 2);
+    app.receive(Message::DatabaseRows {
+        id: "db".into(),
+        generation: 0,
+        result: Ok(Box::new(refreshed)),
+    });
+    let db = app.database().unwrap();
+    assert_eq!(db.selected_row().unwrap().id, "demo-row-0");
+    assert_eq!(
+        db.data.as_ref().unwrap().table_rows()[db.table_row].group,
+        "b"
+    );
+    assert_eq!(db.table_cell, 1);
+    let mut refreshed = db.data.as_ref().unwrap().clone();
+    refreshed
+        .view
+        .configuration
+        .as_mut()
+        .unwrap()
+        .properties
+        .as_mut()
+        .unwrap()
+        .remove(0);
+    app.receive(Message::DatabaseRows {
+        id: "db".into(),
+        generation: 0,
+        result: Ok(Box::new(refreshed)),
+    });
+    assert_eq!(app.database().unwrap().table_cell, 0);
 }
 
 #[test]
@@ -445,7 +685,7 @@ fn append_captures_the_selected_sibling_and_its_parent() {
     app.block_selected = 2;
     app.editor.as_mut().unwrap().buffer.insert("new sibling");
     assert!(matches!(app.editor.as_ref().unwrap().write().unwrap(),
-        Write::Append { parent, after: Some(after), text, .. }
+        Write::Append { parent, position: InsertPosition::After(after), text, .. }
         if parent == "page" && after == "middle" && text == "new sibling"));
 
     app.editor = None;
@@ -460,18 +700,174 @@ fn append_captures_the_selected_sibling_and_its_parent() {
     app.block_selected = 0;
     app.key(KeyCode::Char('a').into());
     assert!(matches!(app.editor.as_ref().unwrap().write().unwrap(),
-        Write::Append { parent, after: Some(after), .. }
+        Write::Append { parent, position: InsertPosition::After(after), .. }
         if parent == "nested" && after == "nested-child"));
 
     app.editor = None;
     app.blocks.clear();
     app.key(KeyCode::Char('a').into());
     assert!(matches!(app.editor.as_ref().unwrap().write().unwrap(),
-        Write::Append { parent, after: None, .. } if parent == "nested"));
+        Write::Append { parent, position: InsertPosition::End, .. } if parent == "nested"));
 
     app.editor = None;
     app.loading_content = true;
     app.key(KeyCode::Char('a').into());
+    assert!(app.editor.is_none());
+}
+
+#[test]
+fn arrows_move_list_selection_and_letters_remain_text() {
+    let (mut app, _) = app();
+    app.blocks = vec![paragraph(); 3];
+    app.pages = vec![
+        PageItem {
+            id: "page".into(),
+            title: "Page".into()
+        };
+        3
+    ];
+    for focus in [Focus::Pages, Focus::Content] {
+        app.focus = focus;
+        app.page_selected = 1;
+        app.block_selected = 1;
+        for key in ['h', 'j', 'k', 'l'] {
+            app.key(KeyCode::Char(key).into());
+        }
+        app.key(KeyCode::Left.into());
+        app.key(KeyCode::Right.into());
+        assert_eq!(app.focus, focus);
+        assert_eq!((app.page_selected, app.block_selected), (1, 1));
+        app.key(KeyCode::Down.into());
+        assert_eq!(
+            if focus == Focus::Pages {
+                app.page_selected
+            } else {
+                app.block_selected
+            },
+            2
+        );
+        app.key(KeyCode::Up.into());
+        assert_eq!((app.page_selected, app.block_selected), (1, 1));
+    }
+    app.key(KeyCode::Char('a').into());
+    for key in ['h', 'j', 'k', 'l'] {
+        app.key(KeyCode::Char(key).into());
+    }
+    assert_eq!(app.editor.as_ref().unwrap().buffer.text, "hjkl");
+    app.editor = None;
+    app.key(KeyCode::Char('/').into());
+    for key in ['h', 'j', 'k', 'l'] {
+        app.key(KeyCode::Char(key).into());
+    }
+    assert_eq!(app.search.as_ref().unwrap().text, "hjkl");
+}
+
+#[test]
+fn readers_and_link_choosers_use_arrows() {
+    let (mut app, _) = app();
+    for help in [true, false] {
+        app.help = help;
+        if !help {
+            app.viewer = Some((app.block_labels()[0].clone(), 0));
+        }
+        app.key(KeyCode::Down.into());
+        app.key(KeyCode::Down.into());
+        app.key(KeyCode::Up.into());
+        assert_eq!(
+            if help {
+                app.help_scroll
+            } else {
+                app.viewer.as_ref().unwrap().1
+            },
+            1
+        );
+        app.key(KeyCode::Char('j').into());
+        // Unbound reader keys close the overlay instead of scrolling.
+        assert!(!app.help && app.viewer.is_none());
+    }
+    app.link_picker = Some(LinkPicker {
+        links: vec![
+            ("One".into(), "https://one.example".into()),
+            ("Two".into(), "https://two.example".into()),
+        ],
+        selected: 0,
+    });
+    app.key(KeyCode::Char('j').into());
+    assert_eq!(app.link_picker.as_ref().unwrap().selected, 0);
+    app.key(KeyCode::Down.into());
+    app.key(KeyCode::Char('k').into());
+    assert_eq!(app.link_picker.as_ref().unwrap().selected, 1);
+    app.key(KeyCode::Up.into());
+    assert_eq!(app.link_picker.as_ref().unwrap().selected, 0);
+}
+
+#[tokio::test]
+async fn insert_before_keeps_its_position_and_draft_after_failure() {
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        for (selected, expected) in [
+            (0, InsertPosition::Start),
+            (1, InsertPosition::After("first".into())),
+            (2, InsertPosition::After("middle".into())),
+        ] {
+            let (mut app, mut rx) = app();
+            app.path.push(Location {
+                id: "nested".into(),
+                title: "Nested".into(),
+                kind: LocationKind::Blocks,
+                page_id: "page".into(),
+                list_depth: 1,
+            });
+            app.blocks = ["first", "middle", "last"]
+                .into_iter()
+                .map(|id| {
+                    let mut block = paragraph();
+                    block.id = id.into();
+                    block
+                })
+                .collect();
+            app.block_selected = selected;
+            app.key(KeyEvent::new(KeyCode::Char('A'), modifiers));
+            app.block_selected = 2;
+            app.key(KeyCode::Tab.into());
+            app.paste("new sibling");
+            app.key(ctrl_s());
+            app.receive(rx.recv().await.unwrap());
+            let editor = app.editor.as_ref().unwrap();
+            assert_eq!(editor.buffer.text, "new sibling");
+            assert_eq!(editor.kind, Kind::Heading1);
+            assert!(editor.error.is_some());
+            assert!(
+                matches!(editor.write().unwrap(), Write::Append { parent, position, .. }
+                if parent == "nested" && position == expected)
+            );
+            app.key(KeyCode::Esc.into());
+            app.key(KeyCode::Char('y').into());
+            assert!(app.editor.is_none());
+        }
+    }
+}
+
+#[test]
+fn insertion_shortcuts_respect_loading_and_selection_guards() {
+    for action in ['a', 'A'] {
+        for (loading, selected, empty_id) in
+            [(true, 0, false), (false, 10, false), (false, 0, true)]
+        {
+            let (mut app, _) = app();
+            app.loading_content = loading;
+            app.block_selected = selected;
+            if empty_id {
+                app.blocks[0].id.clear();
+            }
+            app.key(KeyCode::Char(action).into());
+            assert!(app.editor.is_none());
+        }
+    }
+    let (mut app, _) = app();
+    app.blocks.push(paragraph());
+    app.blocks[0].id.clear();
+    app.block_selected = 1;
+    app.key(KeyCode::Char('A').into());
     assert!(app.editor.is_none());
 }
 
@@ -740,7 +1136,7 @@ async fn nested_navigation_search_and_creation_parent() {
 fn editor_kind_selection_and_title_validation() {
     let mut editor = Editor::new(Target::Append {
         parent: "page".into(),
-        after: None,
+        position: InsertPosition::End,
     });
     editor.cycle_kind();
     assert_eq!(editor.kind, Kind::Heading1);

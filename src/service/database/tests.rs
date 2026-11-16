@@ -8,6 +8,162 @@ fn view() -> View {
     serde_json::from_value(json!({"id":"v","type":"list","data_source_id":"source","configuration":{"type":"list","properties":[{"property_id":"title","visible":true}]}})).unwrap()
 }
 
+fn cell_target(kind: &str, mut value: Value) -> crate::editor::CellTarget {
+    if matches!(kind, "title" | "rich_text") {
+        for run in value.as_array_mut().unwrap() {
+            run["plain_text"] = run["text"]["content"].clone();
+        }
+    }
+    if matches!(kind, "select" | "status") {
+        value["name"] = json!("Option");
+        value["color"] = json!("default");
+    }
+    if kind == "multi_select" {
+        for option in value.as_array_mut().unwrap() {
+            option["name"] = json!("Option");
+            option["color"] = json!("default");
+        }
+    }
+    let mut page = crate::service::tests::page("page", "Page");
+    page["properties"]["P"] = json!({"id":"g%3FNq","type":kind,kind:value});
+    crate::editor::CellTarget {
+        row: DatabaseRow {
+            id: "page".into(),
+            title: "Page".into(),
+            page,
+        },
+        column: crate::database::Column {
+            id: "g?Nq".into(),
+            name: "P".into(),
+            width: 20,
+            wrap: false,
+        },
+        kind: kind.into(),
+        options: vec![],
+    }
+}
+
+#[tokio::test]
+async fn database_cell_writes_update_only_the_requested_property_using_its_encoded_id() {
+    for (kind, value) in [
+        ("title", crate::model::rich_text("New title")),
+        ("rich_text", crate::model::rich_text("你好\n🦀")),
+        ("number", json!(42)),
+        ("checkbox", json!(false)),
+        ("select", json!({"id":"a"})),
+        ("status", json!({"id":"b"})),
+        ("multi_select", json!([{"id":"a"}])),
+        (
+            "date",
+            json!({"start":"2026-11-13","end":null,"time_zone":null}),
+        ),
+        ("url", json!("https://example.com")),
+        ("email", json!("a@example.com")),
+        ("phone_number", json!("123")),
+    ] {
+        let server = MockServer::start().await;
+        let original = cell_target(kind, value.clone());
+        Mock::given(method("GET"))
+            .and(path("/pages/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(original.row.page.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/pages/page"))
+            .and(header("Authorization", "Bearer test"))
+            .and(header("Notion-Version", NOTION_API_VERSION))
+            .and(body_json(json!({"properties":{"g%3FNq":{kind:value}}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        api.write(Write::UpdateDatabaseCell {
+            original: Box::new(original),
+            value,
+        })
+        .await
+        .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn database_cell_conflicts_never_send_a_patch() {
+    for change in ["timestamp", "type", "id", "missing"] {
+        let server = MockServer::start().await;
+        let original = cell_target("number", json!(1));
+        let mut fresh = original.row.page.clone();
+        match change {
+            "timestamp" => fresh["last_edited_time"] = json!("2026-01-02T00:00:00Z"),
+            "type" => {
+                fresh["properties"]["P"] = json!({"id":"g%3FNq","type":"checkbox","checkbox":false})
+            }
+            "id" => fresh["properties"]["P"]["id"] = json!("replacement"),
+            _ => {
+                fresh["properties"].as_object_mut().unwrap().remove("P");
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path("/pages/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fresh))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        let error = api
+            .write(Write::UpdateDatabaseCell {
+                original: Box::new(original),
+                value: json!(2),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Conflict"),
+            "{change}: {error:#}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn database_cell_failed_writes_are_never_retried() {
+    for status in [401, 429, 500, 200] {
+        let server = MockServer::start().await;
+        let original = cell_target("number", json!(1));
+        Mock::given(method("GET"))
+            .and(path("/pages/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(original.row.page.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = if status == 200 {
+            ResponseTemplate::new(status).set_body_string("unreadable")
+        } else {
+            ResponseTemplate::new(status)
+                .set_body_json(json!({"message":"Failed"}))
+                .insert_header("Retry-After", "2")
+        };
+        Mock::given(method("PATCH"))
+            .and(path("/pages/page"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        assert!(
+            api.write(Write::UpdateDatabaseCell {
+                original: Box::new(original),
+                value: json!(2)
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
 #[tokio::test]
 async fn database_views_keep_api_order_and_each_views_data_source() {
     let server = MockServer::start().await;
@@ -69,6 +225,57 @@ fn result(id: &str) -> Value {
 async fn title(server: &MockServer, id: &str) {
     Mock::given(method("GET")).and(path(format!("/pages/{id}/properties/title")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object":"list","results":[{"object":"property_item","id":"title","type":"title","title":{"type":"text","plain_text":id,"text":{"content":id}}}],"has_more":false,"next_cursor":null,"property_item":{"id":"title","type":"title","next_url":null}}))).mount(server).await;
+}
+
+#[tokio::test]
+async fn table_rows_load_missing_page_icons_and_conflict_timestamps() {
+    for inline_metadata in [false, true] {
+        let server = MockServer::start().await;
+        schema(&server).await;
+        title(&server, "one").await;
+        let mut row = result("one");
+        let mut fresh = crate::service::tests::page("one", "Page");
+        fresh["icon"] = json!({"type":"emoji","emoji":"🦀"});
+        if inline_metadata {
+            row["last_edited_time"] = fresh["last_edited_time"].clone();
+            row["icon"] = fresh["icon"].clone();
+        }
+        Mock::given(method("POST"))
+            .and(path("/views/v/queries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"id":"q","view_id":"v","results":[row],"has_more":false,"next_cursor":null}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/views/v/queries/q"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"id":"q","deleted":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pages/one"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fresh))
+            .expect(if inline_metadata { 0 } else { 1 })
+            .mount(&server)
+            .await;
+        let mut table = view();
+        table.view_type = "table".into();
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        let data = api.database_rows(&table, Arc::new(|_| {})).await.unwrap();
+        assert_eq!(data.rows[0].page["icon"]["emoji"], "🦀");
+        assert_eq!(
+            data.rows[0].page["last_edited_time"],
+            "2026-01-01T00:00:00Z"
+        );
+        assert_eq!(data.rows[0].title, "one");
+        assert!(
+            crate::editor::CellTarget::new(&data, &data.rows[0], data.columns()[0].clone()).is_ok()
+        );
+    }
 }
 
 #[tokio::test]

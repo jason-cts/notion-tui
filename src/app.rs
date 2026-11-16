@@ -7,7 +7,7 @@ mod database;
 
 use crate::{
     editor::{Buffer, Editor, Target},
-    model::{BlockItem, BlockLabel, Kind, PageItem, block_labels},
+    model::{BlockItem, BlockLabel, InsertPosition, Kind, PageItem, block_labels},
     service::{Service, Write},
 };
 
@@ -110,7 +110,7 @@ pub struct App {
     pub demo: bool,
     search_generation: u64,
     content_generation: u64,
-    selection_after_insert: Option<(String, String)>,
+    selection_after_insert: Option<(String, InsertPosition)>,
     selection_after_update: Option<(String, String)>,
     selection_after_delete: Option<(String, usize)>,
     service: Service,
@@ -309,13 +309,19 @@ impl App {
                         {
                             self.block_selected = index;
                         }
-                        if let Some((parent, after)) = self.selection_after_insert.take()
+                        if let Some((parent, position)) = self.selection_after_insert.take()
                             && parent == location.id
                         {
-                            self.block_selected = blocks
-                                .iter()
-                                .position(|block| block.id == after)
-                                .map_or(0, |index| (index + 1).min(blocks.len().saturating_sub(1)));
+                            self.block_selected = match position {
+                                InsertPosition::Start => 0,
+                                InsertPosition::After(after) => blocks
+                                    .iter()
+                                    .position(|block| block.id == after)
+                                    .map_or(0, |index| {
+                                        (index + 1).min(blocks.len().saturating_sub(1))
+                                    }),
+                                InsertPosition::End => blocks.len().saturating_sub(1),
+                            };
                         }
                         if let Some((parent, index)) = self.selection_after_delete.take()
                             && parent == location.id
@@ -367,6 +373,9 @@ impl App {
                 self.saving = false;
                 match result {
                     Ok(created) => {
+                        let renamed = self.editor.as_ref().is_some_and(
+                            |e| matches!(&e.target, Target::DatabaseCell(t) if t.kind == "title"),
+                        );
                         self.selection_after_update = self.editor.as_ref().and_then(|editor| {
                             if let Target::Edit(block) = &editor.target {
                                 self.location()
@@ -376,12 +385,8 @@ impl App {
                             }
                         });
                         self.selection_after_insert = self.editor.as_ref().and_then(|editor| {
-                            if let Target::Append {
-                                parent,
-                                after: Some(after),
-                            } = &editor.target
-                            {
-                                Some((parent.clone(), after.clone()))
+                            if let Target::Append { parent, position } = &editor.target {
+                                Some((parent.clone(), position.clone()))
                             } else {
                                 None
                             }
@@ -395,6 +400,9 @@ impl App {
                             self.start_search();
                         } else {
                             self.load();
+                            if renamed {
+                                self.start_search();
+                            }
                         }
                     }
                     Err(error) => {
@@ -465,10 +473,8 @@ impl App {
         }
         if let Some(picker) = &mut self.link_picker {
             match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    picker.selected = (picker.selected + 1) % picker.links.len()
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Down => picker.selected = (picker.selected + 1) % picker.links.len(),
+                KeyCode::Up => {
                     picker.selected =
                         (picker.selected + picker.links.len() - 1) % picker.links.len()
                 }
@@ -492,8 +498,8 @@ impl App {
                 &mut self.viewer.as_mut().unwrap().1
             };
             match key.code {
-                KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
-                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down => *scroll = scroll.saturating_add(1),
+                KeyCode::Up => *scroll = scroll.saturating_sub(1),
                 KeyCode::PageDown => *scroll = scroll.saturating_add(10),
                 KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
                 KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
@@ -557,8 +563,8 @@ impl App {
                     self.load();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
+            KeyCode::Down => self.move_selection(true),
+            KeyCode::Up => self.move_selection(false),
             KeyCode::Home | KeyCode::Char('g') => {
                 if self.focus == Focus::Pages {
                     self.page_selected = 0;
@@ -574,7 +580,7 @@ impl App {
                 }
             }
             KeyCode::Enter => self.enter(),
-            KeyCode::Backspace | KeyCode::Left => {
+            KeyCode::Backspace => {
                 if self.focus == Focus::Content && self.path.len() > 1 {
                     self.path.pop();
                     self.load();
@@ -610,23 +616,36 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('a') if self.focus == Focus::Content => {
+            KeyCode::Char('a' | 'A') if self.focus == Focus::Content => {
                 if self.loading_content {
                     return;
                 }
                 if let Some(location) = self.location() {
-                    let after = self
-                        .blocks
-                        .get(self.block_selected)
-                        .map(|block| block.id.clone());
-                    if (!self.blocks.is_empty() && after.is_none()) || after.as_deref() == Some("")
-                    {
+                    let selected = self.blocks.get(self.block_selected);
+                    if !self.blocks.is_empty() && selected.is_none_or(|block| block.id.is_empty()) {
                         self.fail("Select a block before inserting");
                         return;
                     }
+                    let position = if self.blocks.is_empty() {
+                        InsertPosition::End
+                    } else if key.code == KeyCode::Char('A') {
+                        match self.block_selected.checked_sub(1) {
+                            None => InsertPosition::Start,
+                            Some(index) => {
+                                let previous = &self.blocks[index];
+                                if previous.id.is_empty() {
+                                    self.fail("Select a block before inserting");
+                                    return;
+                                }
+                                InsertPosition::After(previous.id.clone())
+                            }
+                        }
+                    } else {
+                        InsertPosition::After(selected.unwrap().id.clone())
+                    };
                     self.editor = Some(Editor::new(Target::Append {
                         parent: location.id.clone(),
-                        after,
+                        position,
                     }));
                 }
             }

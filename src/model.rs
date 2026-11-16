@@ -14,7 +14,7 @@ pub struct TableCell {
 }
 
 impl TableCell {
-    fn from_value(value: &Value) -> Self {
+    pub(crate) fn from_value(value: &Value) -> Self {
         let runs = value.as_array();
         let input = runs.and_then(|runs| {
             runs.iter()
@@ -390,15 +390,26 @@ pub fn table_row_payload(block: &BlockItem, texts: &[String]) -> Result<Value, &
     Ok(json!({"table_row":{"cells":cells}}))
 }
 
-pub fn append_payload(kind: Kind, text: &str, after: Option<&str>) -> Value {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InsertPosition {
+    Start,
+    After(String),
+    End,
+}
+
+pub fn append_payload(kind: Kind, text: &str, position: &InsertPosition) -> Value {
     let mut fields = json!({"rich_text": rich_text(text)});
     if kind == Kind::Todo {
         fields["checked"] = json!(false);
     }
     let mut payload =
         json!({"children": [{"object": "block", "type": kind.name(), kind.name(): fields}]});
-    if let Some(after) = after {
-        payload["position"] = json!({"type":"after_block","after_block":{"id":after}});
+    match position {
+        InsertPosition::Start => payload["position"] = json!({"type":"start"}),
+        InsertPosition::After(after) => {
+            payload["position"] = json!({"type":"after_block","after_block":{"id":after}});
+        }
+        InsertPosition::End => {}
     }
     payload
 }
@@ -577,7 +588,7 @@ pub(crate) mod tests {
             json!({"to_do":{"checked":true}})
         );
         assert_eq!(
-            append_payload(Kind::Todo, "task", None)["children"][0]["to_do"]["checked"],
+            append_payload(Kind::Todo, "task", &InsertPosition::End)["children"][0]["to_do"]["checked"],
             false
         );
     }

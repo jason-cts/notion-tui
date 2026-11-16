@@ -85,7 +85,14 @@ impl ApiService {
         let mut notices = vec![];
         let required = required_properties(view, &schema);
         for result in pages {
-            let mut page = if result.properties.is_none() {
+            let needs_page_metadata = view.view_type == "table"
+                && (result
+                    .additional
+                    .get("last_edited_time")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                    || !result.additional.contains_key("icon"));
+            let mut page = if result.properties.is_none() || needs_page_metadata {
                 serde_json::to_value(database_read!(self.api.get_page(&result.id))?)?
             } else {
                 serde_json::to_value(result)?
@@ -143,7 +150,14 @@ impl ApiService {
                     .as_ref()
                     .is_some_and(|g| !known_group(g))
             {
-                notices.push("Unsupported grouping; showing a flat list".into());
+                notices.push(
+                    if view.view_type == "table" {
+                        "Unsupported grouping; showing flat table rows"
+                    } else {
+                        "Unsupported grouping; showing a flat list"
+                    }
+                    .into(),
+                );
             }
         }
         if view.sorts.as_ref().is_none_or(Vec::is_empty) {
@@ -396,7 +410,7 @@ pub(crate) fn demo_metadata(id: &str) -> DatabaseMeta {
 }
 pub(crate) fn demo_data(view: View) -> DatabaseData {
     let rows=[("Alpha 🦀","todo","To do"),("Beta","doing","In progress"),("Gamma","done","Done")].into_iter().enumerate().map(|(i,(title,id,name))| {
-        DatabaseRow{id:format!("demo-row-{i}"),title:title.into(),page:json!({"id":format!("demo-row-{i}"),"properties":{"Name":{"id":"title","type":"title","title":[{"plain_text":title,"annotations":{"bold":true}}]},"Status":{"id":"status","type":"status","status":{"id":id,"name":name}},"URL":{"id":"url","type":"url","url":"https://example.com/"}}})}
+        DatabaseRow{id:format!("demo-row-{i}"),title:title.into(),page:json!({"id":format!("demo-row-{i}"),"last_edited_time":"2026-01-01T00:00:00Z","properties":{"Name":{"id":"title","type":"title","title":[{"type":"text","text":{"content":title},"plain_text":title,"annotations":{"bold":true}}]},"Status":{"id":"status","type":"status","status":{"id":id,"name":name}},"URL":{"id":"url","type":"url","url":"https://example.com/"}}})}
     }).collect();
     DatabaseData {
         view,

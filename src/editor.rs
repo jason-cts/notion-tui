@@ -2,16 +2,20 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    model::{BlockItem, Kind},
+    model::{BlockItem, InsertPosition, Kind},
     service::Write,
 };
+
+pub mod database;
+pub use database::{CellDraft, CellTarget};
 
 #[derive(Clone, Debug)]
 pub enum Target {
     Edit(BlockItem),
+    DatabaseCell(Box<CellTarget>),
     Append {
         parent: String,
-        after: Option<String>,
+        position: InsertPosition,
     },
     Create(String),
 }
@@ -128,6 +132,7 @@ pub struct Editor {
     pub target: Target,
     pub buffer: Buffer,
     pub row: Option<RowDraft>,
+    pub cell: Option<CellDraft>,
     pub kind: Kind,
     pub confirmed: bool,
     pub error: Option<String>,
@@ -141,6 +146,10 @@ pub struct RowDraft {
 
 impl Editor {
     pub fn new(target: Target) -> Self {
+        let cell = match &target {
+            Target::DatabaseCell(target) => Some(CellDraft::new(target)),
+            _ => None,
+        };
         let row = match &target {
             Target::Edit(block) if block.editable_table_row() => Some(RowDraft {
                 cells: block
@@ -162,6 +171,7 @@ impl Editor {
             target,
             buffer: Buffer::new(text),
             row,
+            cell,
             kind,
             confirmed: false,
             error: None,
@@ -169,12 +179,18 @@ impl Editor {
     }
 
     pub fn active_buffer(&self) -> &Buffer {
+        if let Some(cell) = &self.cell {
+            return &cell.fields[cell.active];
+        }
         self.row
             .as_ref()
             .map_or(&self.buffer, |row| &row.cells[row.active])
     }
 
     fn active_buffer_mut(&mut self) -> &mut Buffer {
+        if let Some(cell) = &mut self.cell {
+            return &mut cell.fields[cell.active];
+        }
         match &mut self.row {
             Some(row) => &mut row.cells[row.active],
             None => &mut self.buffer,
@@ -182,6 +198,9 @@ impl Editor {
     }
 
     pub fn insert(&mut self, text: &str) {
+        if self.cell.as_ref().is_some_and(|cell| cell.is_picker()) {
+            return;
+        }
         let before = self.active_buffer().text.clone();
         let text = if matches!(self.target, Target::Create(_)) {
             text.replace(['\n', '\r'], " ")
@@ -195,6 +214,20 @@ impl Editor {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        if let Some(cell) = &mut self.cell {
+            let before = (
+                cell.fields
+                    .iter()
+                    .map(|f| f.text.clone())
+                    .collect::<Vec<_>>(),
+                cell.checked.clone(),
+            );
+            cell.key(key);
+            if before.0.iter().ne(cell.fields.iter().map(|f| &f.text)) || before.1 != cell.checked {
+                self.confirmed = false;
+            }
+            return;
+        }
         if let Some(row) = &mut self.row {
             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                 let backwards =
@@ -216,6 +249,9 @@ impl Editor {
     }
 
     pub fn character_count(&self) -> usize {
+        if let Some(cell) = &self.cell {
+            return cell.fields.iter().map(|b| b.text.chars().count()).sum();
+        }
         self.row.as_ref().map_or_else(
             || self.buffer.text.chars().count(),
             |row| row.cells.iter().map(|cell| cell.text.chars().count()).sum(),
@@ -223,6 +259,9 @@ impl Editor {
     }
 
     pub fn changed(&self) -> bool {
+        if let Some(cell) = &self.cell {
+            return cell.changed();
+        }
         match &self.target {
             Target::Edit(block) => match &self.row {
                 Some(row) => row
@@ -241,6 +280,14 @@ impl Editor {
             return false;
         }
         match &self.target {
+            Target::DatabaseCell(target) => {
+                let cell = self.cell.as_ref().unwrap();
+                let value =
+                    crate::database::property(&target.row, &target.column.id, &target.column.name);
+                matches!(cell.kind.as_str(), "title" | "rich_text")
+                    && crate::model::TableCell::from_value(&value[&cell.kind]).styled
+                    && self.changed()
+            }
             Target::Edit(block) => match &self.row {
                 Some(row) => row
                     .cells
@@ -265,6 +312,10 @@ impl Editor {
             return Err("Text is limited to 100,000 characters per block");
         }
         Ok(match &self.target {
+            Target::DatabaseCell(original) => Write::UpdateDatabaseCell {
+                original: original.clone(),
+                value: self.cell.as_ref().unwrap().value()?,
+            },
             Target::Edit(original) => match &self.row {
                 Some(row) => Write::UpdateTableRow {
                     original: original.clone(),
@@ -275,9 +326,9 @@ impl Editor {
                     text: Some(self.buffer.text.clone()),
                 },
             },
-            Target::Append { parent, after } => Write::Append {
+            Target::Append { parent, position } => Write::Append {
                 parent: parent.clone(),
-                after: after.clone(),
+                position: position.clone(),
                 kind: self.kind,
                 text: self.buffer.text.clone(),
             },

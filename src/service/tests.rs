@@ -557,7 +557,7 @@ async fn failed_append_is_not_retried_and_rate_limit_is_actionable() {
         .and(body_json(append_payload(
             Kind::Todo,
             "task",
-            Some("anchor"),
+            &InsertPosition::After("anchor".into()),
         )))
         .respond_with(
             ResponseTemplate::new(429)
@@ -571,7 +571,7 @@ async fn failed_append_is_not_retried_and_rate_limit_is_actionable() {
     let error = api
         .write(Write::Append {
             parent: "page".into(),
-            after: Some("anchor".into()),
+            position: InsertPosition::After("anchor".into()),
             kind: Kind::Todo,
             text: "task".into(),
         })
@@ -588,86 +588,114 @@ async fn insertion_uses_selected_anchor_and_focuses_the_new_sibling_after_refres
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     for (parent, is_page) in [("page", true), ("nested", false)] {
-        let server = MockServer::start().await;
-        let make_block = |id: &str| {
-            let mut value = block("2026-01-01T00:00:00Z");
-            value["id"] = json!(id);
-            value
-        };
-        Mock::given(method("PATCH"))
-            .and(path(format!("/blocks/{parent}/children")))
-            .and(header("Notion-Version", "2026-03-11"))
-            .and(body_json(json!({"position":{"type":"after_block","after_block":{"id":"middle"}}, "children":[{
+        for (action, selected, empty, anchor, inserted_index) in [
+            ('a', 1, false, Some("middle"), 2),
+            ('A', 0, false, None, 0),
+            ('A', 1, false, Some("first"), 1),
+            ('A', 2, false, Some("middle"), 2),
+            ('a', 0, true, None, 0),
+            ('A', 0, true, None, 0),
+        ] {
+            let server = MockServer::start().await;
+            let make_block = |id: &str| {
+                let mut value = block("2026-01-01T00:00:00Z");
+                value["id"] = json!(id);
+                value
+            };
+            let mut expected_body = json!({"children":[{
                 "object":"block", "type":"paragraph", "paragraph":{"rich_text":[
                     {"type":"text","text":{"content":"new sibling"}}
                 ]}
-            }]})))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(list(json!([make_block("inserted")]), None)),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        if is_page {
-            Mock::given(method("GET"))
-                .and(path("/pages/page"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(page("page", "Page")))
+            }]});
+            if let Some(anchor) = anchor {
+                expected_body["position"] =
+                    json!({"type":"after_block","after_block":{"id":anchor}});
+            } else if !empty {
+                expected_body["position"] = json!({"type":"start"});
+            }
+            Mock::given(method("PATCH"))
+                .and(path(format!("/blocks/{parent}/children")))
+                .and(header("Notion-Version", "2026-03-11"))
+                .and(body_json(expected_body))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(list(json!([make_block("inserted")]), None)),
+                )
                 .expect(1)
                 .mount(&server)
                 .await;
-        }
-        Mock::given(method("GET"))
-            .and(path(format!("/blocks/{parent}/children")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(list(
-                json!([
-                    make_block("first"),
-                    make_block("middle"),
-                    make_block("inserted"),
-                    make_block("last")
-                ]),
-                None,
-            )))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let api = Arc::new(ApiService::with_base_url("test".into(), &server.uri()).unwrap());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(api, tx, false);
-        app.path.push(Location {
-            id: parent.into(),
-            title: parent.into(),
-            kind: if is_page {
-                crate::app::LocationKind::Page
+            if is_page {
+                Mock::given(method("GET"))
+                    .and(path("/pages/page"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(page("page", "Page")))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let initial: Vec<_> = if empty {
+                vec![]
             } else {
-                crate::app::LocationKind::Blocks
-            },
-            page_id: "page".into(),
-            list_depth: usize::from(!is_page),
-        });
-        app.focus = Focus::Content;
-        app.blocks = ["first", "middle", "last"]
-            .into_iter()
-            .map(|id| BlockItem::from_value(&make_block(id)))
-            .collect();
-        app.block_selected = 1;
-        app.key(KeyCode::Char('a').into());
-        assert!(
-            matches!(&app.editor.as_ref().unwrap().target, Target::Append { after: Some(after), .. } if after == "middle")
-        );
-        app.paste("new sibling");
-        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        for _ in 0..2 {
-            let message = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            app.receive(message);
+                vec!["first", "middle", "last"]
+            };
+            let mut refreshed = initial.clone();
+            refreshed.insert(inserted_index, "inserted");
+            Mock::given(method("GET"))
+                .and(path(format!("/blocks/{parent}/children")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(list(
+                    json!(refreshed.iter().map(|id| make_block(id)).collect::<Vec<_>>()),
+                    None,
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = Arc::new(ApiService::with_base_url("test".into(), &server.uri()).unwrap());
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(api, tx, false);
+            app.path.push(Location {
+                id: parent.into(),
+                title: parent.into(),
+                kind: if is_page {
+                    crate::app::LocationKind::Page
+                } else {
+                    crate::app::LocationKind::Blocks
+                },
+                page_id: "page".into(),
+                list_depth: usize::from(!is_page),
+            });
+            app.focus = Focus::Content;
+            app.blocks = initial
+                .iter()
+                .map(|id| BlockItem::from_value(&make_block(id)))
+                .collect();
+            app.block_selected = selected;
+            app.key(KeyCode::Char(action).into());
+            let expected_position = if empty {
+                InsertPosition::End
+            } else if let Some(anchor) = anchor {
+                InsertPosition::After(anchor.into())
+            } else {
+                InsertPosition::Start
+            };
+            assert!(
+                matches!(&app.editor.as_ref().unwrap().target, Target::Append { parent: target_parent, position }
+            if target_parent == parent && position == &expected_position)
+            );
+            // Later selection changes must not change the captured insertion point.
+            app.block_selected = 0;
+            app.paste("new sibling");
+            app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            for _ in 0..2 {
+                let message = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                app.receive(message);
+            }
+            assert!(app.editor.is_none());
+            assert!(!app.loading_content);
+            assert_eq!(app.blocks[app.block_selected].id, "inserted");
+            assert_eq!(app.block_selected, inserted_index);
         }
-        assert!(app.editor.is_none());
-        assert!(!app.loading_content);
-        assert_eq!(app.blocks[app.block_selected].id, "inserted");
-        assert_eq!(app.block_selected, 2);
     }
 }
 
@@ -687,7 +715,7 @@ async fn insertion_into_an_empty_container_omits_the_anchor() {
     let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
     api.write(Write::Append {
         parent: "empty".into(),
-        after: None,
+        position: InsertPosition::End,
         kind: Kind::Paragraph,
         text: "first".into(),
     })

@@ -543,7 +543,7 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
     let mut app = crate::app::App::new(api.clone(), tx, false);
     let mut editor = crate::editor::Editor::new(crate::editor::Target::Append {
         parent: "page".into(),
-        after: Some("anchor".into()),
+        position: crate::model::InsertPosition::After("anchor".into()),
     });
     editor.buffer.insert("unsaved draft");
     app.editor = Some(editor);
@@ -560,7 +560,7 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
     assert!(!app.saving);
     assert_eq!(app.editor.as_ref().unwrap().buffer.text, "unsaved draft");
     assert!(matches!(&app.editor.as_ref().unwrap().target,
-        crate::editor::Target::Append { after: Some(after), .. } if after == "anchor"));
+        crate::editor::Target::Append { position: crate::model::InsertPosition::After(after), .. } if after == "anchor"));
     assert!(
         app.editor
             .as_ref()
@@ -589,7 +589,7 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
         .await;
     api.write(Write::Append {
         parent: "page".into(),
-        after: Some("anchor".into()),
+        position: crate::model::InsertPosition::After("anchor".into()),
         kind: Kind::Paragraph,
         text: "unsaved draft".into(),
     })

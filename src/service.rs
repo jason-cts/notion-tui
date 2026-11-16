@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 
 use crate::auth::{AuthError, OAuthSession, is_unauthorized};
 use crate::database::{DatabaseData, DatabaseMeta};
-use crate::model::{BlockItem, Kind, PageItem, append_payload, table_row_payload, update_payload};
+use crate::model::{
+    BlockItem, InsertPosition, Kind, PageItem, append_payload, table_row_payload, update_payload,
+};
 use rusticnotion::models::view::View;
 
 pub(crate) mod database;
@@ -20,6 +22,10 @@ pub type Progress = Arc<dyn Fn(usize) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub enum Write {
+    UpdateDatabaseCell {
+        original: Box<crate::editor::CellTarget>,
+        value: Value,
+    },
     Delete {
         original: BlockItem,
     },
@@ -33,7 +39,7 @@ pub enum Write {
     },
     Append {
         parent: String,
-        after: Option<String>,
+        position: InsertPosition,
         kind: Kind,
         text: String,
     },
@@ -319,6 +325,45 @@ impl NotionService for ApiService {
 
     async fn write(&self, write: Write) -> Result<Option<PageItem>> {
         match write {
+            Write::UpdateDatabaseCell { original, value } => {
+                let modified = original.row.page["last_edited_time"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .context(
+                        "Cannot save without a page modification timestamp; cancel and refresh",
+                    )?;
+                let fresh = serde_json::to_value(
+                    self.api
+                        .get_page(original.row.id.parse::<PageId>()?)
+                        .await
+                        .context("Could not check for remote changes; draft retained")?,
+                )?;
+                let row = crate::database::DatabaseRow {
+                    id: original.row.id.clone(),
+                    title: String::new(),
+                    page: fresh,
+                };
+                let prop =
+                    crate::database::property(&row, &original.column.id, &original.column.name);
+                if row.page["last_edited_time"].as_str() != Some(modified)
+                    || prop["type"].as_str() != Some(&original.kind)
+                    || !prop["id"].as_str().is_some_and(|id| {
+                        crate::database::same_property_id(id, &original.column.id)
+                    })
+                {
+                    bail!(
+                        "Conflict: page or property changed in Notion. Draft retained; cancel and refresh before editing again"
+                    );
+                }
+                // Use the response's encoded ID exactly as returned. Only this
+                // property is sent, leaving every other page value unchanged.
+                let id = prop["id"].as_str().unwrap();
+                self.patch(
+                    &format!("/pages/{}", original.row.id),
+                    json!({"properties": {id: {&original.kind: value}}}),
+                )
+                .await?;
+            }
             Write::Delete { original } => {
                 if original.id.is_empty() || original.modified.is_empty() {
                     bail!(
@@ -381,13 +426,13 @@ impl NotionService for ApiService {
             }
             Write::Append {
                 parent,
-                after,
+                position,
                 kind,
                 text,
             } => {
                 self.patch(
                     &format!("/blocks/{parent}/children"),
-                    append_payload(kind, &text, after.as_deref()),
+                    append_payload(kind, &text, &position),
                 )
                 .await?;
             }
