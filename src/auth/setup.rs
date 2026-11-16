@@ -243,7 +243,9 @@ pub async fn choose(force_oauth: bool, events: &mut EventStream) -> Result<Optio
     if let Ok(config) = form.oauth_config() {
         return Ok(Some(Choice::OAuth(config)));
     }
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard {
+        enhanced_keys: false,
+    };
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableBracketedPaste)?;
     while let Some(event) = {

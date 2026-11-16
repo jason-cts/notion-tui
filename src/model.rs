@@ -5,10 +5,100 @@ use rusticnotion::models::{
 };
 use serde_json::{Value, json};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct RichText(pub Vec<RichTextInput>);
+
+impl RichText {
+    pub fn normalized(&self) -> Self {
+        let mut runs: Vec<RichTextInput> = vec![];
+        for mut run in self.0.clone() {
+            if let Some(a) = &mut run.annotations {
+                for flag in [
+                    &mut a.bold,
+                    &mut a.italic,
+                    &mut a.underline,
+                    &mut a.strikethrough,
+                    &mut a.code,
+                ] {
+                    if *flag == Some(false) {
+                        *flag = None;
+                    }
+                }
+                if a.color == Some(rusticnotion::models::text::TextColor::Default) {
+                    a.color = None;
+                }
+                if a.bold.is_none()
+                    && a.italic.is_none()
+                    && a.underline.is_none()
+                    && a.strikethrough.is_none()
+                    && a.code.is_none()
+                    && a.color.is_none()
+                {
+                    run.annotations = None;
+                }
+            }
+            if let Some(last) = runs.last_mut()
+                && last.annotations == run.annotations
+                && let RichTextContent::Text { text: previous } = &mut last.content
+                && let RichTextContent::Text { text } = &run.content
+                && previous.link == text.link
+            {
+                previous.content.push_str(&text.content);
+            } else {
+                runs.push(run);
+            }
+        }
+        Self(runs).chunked()
+    }
+
+    pub fn plain(&self) -> String {
+        self.0
+            .iter()
+            .filter_map(|run| match &run.content {
+                RichTextContent::Text { text } => Some(text.content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn chunked(self) -> Self {
+        let mut result = vec![];
+        for run in self.0 {
+            if let RichTextContent::Text { text } = run.content {
+                let chars: Vec<_> = text.content.chars().collect();
+                for chunk in chars.chunks(2000) {
+                    result.push(RichTextInput {
+                        content: RichTextContent::Text {
+                            text: TextInput {
+                                content: chunk.iter().collect(),
+                                link: text.link.clone(),
+                            },
+                        },
+                        annotations: run.annotations.clone(),
+                    });
+                }
+            }
+        }
+        Self(result)
+    }
+}
+
+impl From<String> for RichText {
+    fn from(text: String) -> Self {
+        Self(vec![RichTextInput::from(text)]).chunked()
+    }
+}
+
+impl From<&str> for RichText {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TableCell {
     pub text: String,
-    pub styled: bool,
     // None means a mention, equation, or unrecognized run cannot safely round-trip.
     pub input: Option<Vec<RichTextInput>>,
 }
@@ -45,24 +135,9 @@ impl TableCell {
                         .collect()
                 })
                 .unwrap_or_default(),
-            styled: runs.is_some_and(|runs| runs.iter().any(styled_run)),
             input,
         }
     }
-}
-
-fn styled_run(run: &Value) -> bool {
-    !run["text"]["link"].is_null()
-        || !run["href"].is_null()
-        || run["annotations"].as_object().is_some_and(|annotations| {
-            annotations.iter().any(|(key, value)| {
-                if key == "color" {
-                    value.as_str().is_some_and(|color| color != "default")
-                } else {
-                    value.as_bool() == Some(true)
-                }
-            })
-        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,11 +188,11 @@ pub struct BlockItem {
     pub block_type: String,
     pub text: String,
     pub rich_text: Vec<RichRun>,
+    pub input: Option<RichText>,
     pub table_cells: Option<Vec<TableCell>>,
     pub children: bool,
     pub checked: bool,
     pub kind: Option<Kind>,
-    pub styled: bool,
     pub protected: bool,
     pub child_page: bool,
 }
@@ -127,6 +202,9 @@ impl BlockItem {
         let block_type = value["type"].as_str().unwrap_or("unsupported").to_owned();
         let body = &value[&block_type];
         let runs = body["rich_text"].as_array();
+        let input = runs
+            .and_then(|_| TableCell::from_value(&body["rich_text"]).input)
+            .map(RichText);
         let mut rich_text: Vec<RichRun> = runs
             .map(|runs| runs.iter().map(RichRun::from_value).collect())
             .unwrap_or_default();
@@ -183,11 +261,8 @@ impl BlockItem {
                     .map(|cells| cells.iter().map(TableCell::from_value).collect::<Vec<_>>())
             })
             .flatten();
-        let styled = runs.is_some_and(|runs| runs.iter().any(styled_run))
-            || table_cells
-                .as_ref()
-                .is_some_and(|cells| cells.iter().any(|cell| cell.styled));
         let protected = runs.is_some_and(|runs| runs.iter().any(|r| r["type"] != "text"))
+            || (runs.is_some() && input.is_none())
             || table_cells
                 .as_ref()
                 .is_some_and(|cells| cells.iter().any(|cell| cell.input.is_none()));
@@ -204,8 +279,8 @@ impl BlockItem {
             block_type,
             text,
             rich_text,
+            input,
             table_cells,
-            styled,
             protected,
         }
     }
@@ -338,6 +413,7 @@ pub fn block_labels(blocks: &[BlockItem], depth: usize) -> Vec<BlockLabel> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn rich_text(text: &str) -> Value {
     // Notion limits each rich-text content string to 2,000 characters.
     let chars: Vec<char> = text.chars().collect();
@@ -353,10 +429,10 @@ pub fn rich_text(text: &str) -> Value {
     )
 }
 
-pub fn update_payload(block: &BlockItem, text: Option<&str>) -> Value {
+pub fn update_payload(block: &BlockItem, text: Option<&RichText>) -> Value {
     let mut fields = json!({});
     if let Some(text) = text {
-        fields["rich_text"] = rich_text(text);
+        fields["rich_text"] = json!(text);
     }
     if block.kind == Some(Kind::Todo) && text.is_none() {
         fields["checked"] = json!(!block.checked);
@@ -364,7 +440,7 @@ pub fn update_payload(block: &BlockItem, text: Option<&str>) -> Value {
     json!({block.block_type.clone(): fields})
 }
 
-pub fn table_row_payload(block: &BlockItem, texts: &[String]) -> Result<Value, &'static str> {
+pub fn table_row_payload(block: &BlockItem, texts: &[RichText]) -> Result<Value, &'static str> {
     if !block.editable_table_row() {
         return Err("This table row contains unsupported content or has no cells");
     }
@@ -372,22 +448,15 @@ pub fn table_row_payload(block: &BlockItem, texts: &[String]) -> Result<Value, &
     if cells.len() != texts.len() {
         return Err("Table row cell count changed; cancel and refresh before editing again");
     }
-    if texts.iter().map(|text| text.chars().count()).sum::<usize>() > 100_000 {
+    if texts
+        .iter()
+        .map(|text| text.plain().chars().count())
+        .sum::<usize>()
+        > 100_000
+    {
         return Err("Text is limited to 100,000 characters per block");
     }
-    let cells = cells
-        .iter()
-        .zip(texts)
-        .map(|(cell, text)| {
-            if cell.text == *text {
-                serde_json::to_value(cell.input.as_ref().unwrap())
-                    .map_err(|_| "Could not preserve original cell formatting")
-            } else {
-                Ok(rich_text(text))
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({"table_row":{"cells":cells}}))
+    Ok(json!({"table_row":{"cells":texts}}))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,8 +466,8 @@ pub enum InsertPosition {
     End,
 }
 
-pub fn append_payload(kind: Kind, text: &str, position: &InsertPosition) -> Value {
-    let mut fields = json!({"rich_text": rich_text(text)});
+pub fn append_payload(kind: Kind, text: &RichText, position: &InsertPosition) -> Value {
+    let mut fields = json!({"rich_text": text});
     if kind == Kind::Todo {
         fields["checked"] = json!(false);
     }
@@ -442,14 +511,13 @@ pub(crate) mod tests {
         let row = table_row();
         let cells = row.table_cells.as_ref().unwrap();
         assert!(row.editable_table_row());
-        assert!(row.styled);
         assert_eq!(cells.len(), 3);
         assert_eq!(cells[0].text, "left │ side\n你好");
         assert_eq!(row.text, "left │ side\n你好 │ Styled tail │ ");
         assert!(row.rich_text.iter().any(|run| run.url.is_some()));
         let mut texts = cells
             .iter()
-            .map(|cell| cell.text.clone())
+            .map(|cell| RichText(cell.input.clone().unwrap()))
             .collect::<Vec<_>>();
         texts[0] = "new\n🦀 │ text".into();
         let payload = table_row_payload(&row, &texts).unwrap();
@@ -468,6 +536,20 @@ pub(crate) mod tests {
         );
         texts.pop();
         assert!(table_row_payload(&row, &texts).is_err());
+    }
+
+    #[test]
+    fn malformed_block_inputs_remain_read_only_instead_of_losing_annotations() {
+        for run in [
+            json!({"type":"text","plain_text":"missing text input"}),
+            json!({"type":"text","text":{"content":"unknown color"},"annotations":{"color":"future_color"}}),
+            json!({"type":"text","text":{"content":"bad link","link":{"unknown":true}}}),
+        ] {
+            let block =
+                BlockItem::from_value(&json!({"type":"paragraph","paragraph":{"rich_text":[run]}}));
+            assert!(block.protected);
+            assert!(block.input.is_none());
+        }
     }
 
     #[test]
@@ -491,7 +573,7 @@ pub(crate) mod tests {
     #[test]
     fn table_row_chunks_unicode_and_preserves_empty_cells() {
         let row = table_row();
-        let texts = vec!["🦀".repeat(4001), "".into(), "".into()];
+        let texts = vec!["🦀".repeat(4001).into(), "".into(), "".into()];
         let payload = table_row_payload(&row, &texts).unwrap();
         let chunks = payload["table_row"]["cells"][0].as_array().unwrap();
         assert_eq!(chunks.len(), 3);
@@ -505,7 +587,9 @@ pub(crate) mod tests {
         );
         assert_eq!(payload["table_row"]["cells"][1], json!([]));
         assert_eq!(payload["table_row"]["cells"][2], json!([]));
-        assert!(table_row_payload(&row, &["x".repeat(100_001), "".into(), "".into()]).is_err());
+        assert!(
+            table_row_payload(&row, &["x".repeat(100_001).into(), "".into(), "".into()]).is_err()
+        );
     }
 
     #[test]
@@ -576,7 +660,7 @@ pub(crate) mod tests {
     fn payloads_never_replace_children_or_send_response_fields() {
         let block = paragraph();
         assert_eq!(
-            update_payload(&block, Some("new")),
+            update_payload(&block, Some(&"new".into())),
             json!({"paragraph":{"rich_text":[
             {"type":"text","text":{"content":"new"}}]}})
         );
@@ -588,7 +672,8 @@ pub(crate) mod tests {
             json!({"to_do":{"checked":true}})
         );
         assert_eq!(
-            append_payload(Kind::Todo, "task", &InsertPosition::End)["children"][0]["to_do"]["checked"],
+            append_payload(Kind::Todo, &"task".into(), &InsertPosition::End)["children"][0]["to_do"]
+                ["checked"],
             false
         );
     }
@@ -605,6 +690,6 @@ pub(crate) mod tests {
         let b = BlockItem::from_value(&json!({"type":"paragraph","paragraph":{"rich_text":[
             {"type":"mention","plain_text":"person","annotations":{"bold":true}}
         ]}}));
-        assert!(b.protected && b.styled);
+        assert!(b.protected);
     }
 }

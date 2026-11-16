@@ -32,6 +32,87 @@ fn table_row() -> Value {
 }
 
 #[tokio::test]
+async fn formatted_block_update_and_insertion_send_annotations_and_links() {
+    use crate::editor::{Editor, Target};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for insert in [false, true] {
+        let server = MockServer::start().await;
+        let mut original = block("2026-01-01T00:00:00Z");
+        original["paragraph"]["rich_text"] = json!([{"type":"text","plain_text":"Hello","text":{"content":"Hello","link":{"url":"https://example.com/"}},"annotations":{"code":true,"color":"blue"}}]);
+        let mut editor = Editor::new(Target::Edit(BlockItem::from_value(&original)));
+        editor.key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+        editor.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        editor.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
+        editor.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        editor.buffer.toggle_style(3);
+        if insert {
+            editor.target = Target::Append {
+                parent: "page".into(),
+                position: InsertPosition::Start,
+            };
+        } else {
+            Mock::given(method("GET"))
+                .and(path("/blocks/block"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(original))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let runs = json!([{"type":"text","text":{"content":"Hello","link":{"url":"https://example.com/"}},"annotations":{"bold":true,"italic":true,"underline":true,"strikethrough":true,"code":true,"color":"blue"}}]);
+        let expected = if insert {
+            json!({"children":[{"object":"block","type":"paragraph","paragraph":{"rich_text":runs}}],"position":{"type":"start"}})
+        } else {
+            json!({"paragraph":{"rich_text":runs}})
+        };
+        Mock::given(method("PATCH"))
+            .and(path(if insert {
+                "/blocks/page/children"
+            } else {
+                "/blocks/block"
+            }))
+            .and(body_json(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        api.write(editor.write().unwrap()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn table_row_formatting_only_save_keeps_untouched_cells() {
+    use crate::editor::{Editor, Target};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let server = MockServer::start().await;
+    let original = table_row();
+    let mut expected = json!({"table_row":{"cells":[
+        [{"type":"text","text":{"content":"first │ cell\n你好"}}],
+        [{"type":"text","text":{"content":"Link","link":{"url":"https://example.com/"}},"annotations":{"bold":true,"color":"blue","italic":true}}], []
+    ]}});
+    let mut editor = Editor::new(Target::Edit(BlockItem::from_value(&original)));
+    editor.key(KeyCode::Tab.into());
+    editor.key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+    editor.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
+    assert!(editor.changed());
+    Mock::given(method("GET"))
+        .and(path("/blocks/block"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(original))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/blocks/block"))
+        .and(body_json(expected.take()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+    api.write(editor.write().unwrap()).await.unwrap();
+}
+
+#[tokio::test]
 async fn deletion_checks_fresh_blocks_and_sends_a_bodyless_authenticated_delete() {
     for block_type in [
         "paragraph",
@@ -224,9 +305,15 @@ async fn table_row_reads_and_updates_all_cells_preserving_unchanged_rich_text() 
         original.table_cells.as_ref().unwrap()[0].text,
         "first │ cell\n你好"
     );
+    let preserved = RichText(
+        original.table_cells.as_ref().unwrap()[1]
+            .input
+            .clone()
+            .unwrap(),
+    );
     api.write(Write::UpdateTableRow {
         original,
-        cells: vec!["changed\n🦀 │ cell".into(), "Link".into(), "".into()],
+        cells: vec!["changed\n🦀 │ cell".into(), preserved, "".into()],
     })
     .await
     .unwrap();
@@ -285,18 +372,18 @@ async fn invalid_table_row_drafts_are_rejected_before_network_access() {
     for (mut original, cells) in [
         (
             BlockItem::from_value(&table_row()),
-            vec!["wrong count".into()],
+            vec![RichText::from("wrong count")],
         ),
         (
             BlockItem::from_value(&table_row()),
-            vec!["x".repeat(100_001), "".into(), "".into()],
+            vec!["x".repeat(100_001).into(), "".into(), "".into()],
         ),
         (
             BlockItem::from_value(&table_row()),
             vec!["protected".into(), "".into(), "".into()],
         ),
     ] {
-        if cells[0] == "protected" {
+        if cells[0].plain() == "protected" {
             original.protected = true;
         }
         assert!(
@@ -556,7 +643,7 @@ async fn failed_append_is_not_retried_and_rate_limit_is_actionable() {
         .and(path("/blocks/page/children"))
         .and(body_json(append_payload(
             Kind::Todo,
-            "task",
+            &"task".into(),
             &InsertPosition::After("anchor".into()),
         )))
         .respond_with(

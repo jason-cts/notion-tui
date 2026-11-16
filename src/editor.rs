@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
@@ -8,6 +9,8 @@ use crate::{
 
 pub mod database;
 pub use database::{CellDraft, CellTarget};
+pub mod rich;
+use rich::{RichDraft, StylePicker};
 
 #[derive(Clone, Debug)]
 pub enum Target {
@@ -24,6 +27,8 @@ pub enum Target {
 pub struct Buffer {
     pub text: String,
     pub cursor: usize,
+    pub rich: Option<RichDraft>,
+    anchor: Option<usize>,
 }
 
 impl Buffer {
@@ -31,6 +36,7 @@ impl Buffer {
         Self {
             cursor: text.len(),
             text,
+            ..Self::default()
         }
     }
 
@@ -43,8 +49,10 @@ impl Buffer {
             .chars()
             .filter(|c| !c.is_control() || *c == '\n')
             .collect();
-        self.text.insert_str(self.cursor, &clean);
-        self.cursor += clean.len();
+        if clean.is_empty() {
+            return;
+        }
+        self.replace(self.selection().unwrap_or(self.cursor..self.cursor), &clean);
     }
 
     pub fn position(&self) -> (usize, usize) {
@@ -57,7 +65,7 @@ impl Buffer {
 
     fn vertical(&mut self, down: bool) {
         let start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
-        let col = self.text[start..self.cursor].chars().count();
+        let col = self.text[start..self.cursor].graphemes(true).count();
         let target = if down {
             match self.text[self.cursor..].find('\n') {
                 Some(n) => self.cursor + n + 1,
@@ -70,7 +78,11 @@ impl Buffer {
             self.text[..start - 1].rfind('\n').map_or(0, |i| i + 1)
         };
         let line = self.text[target..].split('\n').next().unwrap_or("");
-        self.cursor = target + line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
+        self.cursor = target
+            + line
+                .grapheme_indices(true)
+                .nth(col)
+                .map_or(line.len(), |(i, _)| i);
     }
 
     pub fn key(&mut self, key: KeyEvent, multiline: bool) {
@@ -80,6 +92,35 @@ impl Buffer {
             KeyCode::Char('h') if key.modifiers == KeyModifiers::CONTROL => KeyCode::Backspace,
             code => code,
         };
+        let movement = matches!(
+            code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        );
+        if !key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(code, KeyCode::Left | KeyCode::Right)
+            && let Some(range) = self.selection()
+        {
+            self.cursor = if code == KeyCode::Left {
+                range.start
+            } else {
+                range.end
+            };
+            self.anchor = None;
+            self.refresh_typing();
+            return;
+        }
+        if movement && self.rich.is_some() {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.anchor.get_or_insert(self.cursor);
+            } else {
+                self.anchor = None;
+            }
+        }
         match code {
             KeyCode::Char(c)
                 if !key
@@ -91,13 +132,13 @@ impl Buffer {
             KeyCode::Enter if multiline => self.insert("\n"),
             KeyCode::Tab if multiline => self.insert("    "),
             KeyCode::Left => {
-                if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
+                if let Some((i, _)) = self.text[..self.cursor].grapheme_indices(true).next_back() {
                     self.cursor = i;
                 }
             }
             KeyCode::Right => {
-                if let Some(c) = self.text[self.cursor..].chars().next() {
-                    self.cursor += c.len_utf8();
+                if let Some(c) = self.text[self.cursor..].graphemes(true).next() {
+                    self.cursor += c.len();
                 }
             }
             KeyCode::Home => {
@@ -111,18 +152,25 @@ impl Buffer {
             KeyCode::Up => self.vertical(false),
             KeyCode::Down => self.vertical(true),
             KeyCode::Backspace => {
-                if let Some((i, _)) = self.text[..self.cursor].char_indices().next_back() {
-                    self.text.replace_range(i..self.cursor, "");
-                    self.cursor = i;
+                if let Some(range) = self.selection() {
+                    self.replace(range, "");
+                } else if let Some((i, _)) =
+                    self.text[..self.cursor].grapheme_indices(true).next_back()
+                {
+                    self.replace(i..self.cursor, "");
                 }
             }
             KeyCode::Delete => {
-                if let Some(c) = self.text[self.cursor..].chars().next() {
-                    self.text
-                        .replace_range(self.cursor..self.cursor + c.len_utf8(), "");
+                if let Some(range) = self.selection() {
+                    self.replace(range, "");
+                } else if let Some(c) = self.text[self.cursor..].graphemes(true).next() {
+                    self.replace(self.cursor..self.cursor + c.len(), "");
                 }
             }
             _ => {}
+        }
+        if movement {
+            self.refresh_typing();
         }
     }
 }
@@ -134,7 +182,7 @@ pub struct Editor {
     pub row: Option<RowDraft>,
     pub cell: Option<CellDraft>,
     pub kind: Kind,
-    pub confirmed: bool,
+    pub style_picker: Option<StylePicker>,
     pub error: Option<String>,
 }
 
@@ -157,7 +205,7 @@ impl Editor {
                     .as_ref()
                     .unwrap()
                     .iter()
-                    .map(|cell| Buffer::new(cell.text.clone()))
+                    .map(|cell| Buffer::from_rich(cell.input.as_deref().unwrap_or_default()))
                     .collect(),
                 active: 0,
             }),
@@ -167,13 +215,24 @@ impl Editor {
             Target::Edit(b) => (b.text.clone(), b.kind.unwrap_or(Kind::Paragraph)),
             _ => (String::new(), Kind::Paragraph),
         };
+        let buffer = match &target {
+            Target::Edit(block) if row.is_none() => Buffer::from_rich(
+                &block
+                    .input
+                    .clone()
+                    .unwrap_or_else(|| block.text.clone().into())
+                    .0,
+            ),
+            Target::Append { .. } => Buffer::from_rich(&[]),
+            _ => Buffer::new(text),
+        };
         Self {
             target,
-            buffer: Buffer::new(text),
+            buffer,
             row,
             cell,
             kind,
-            confirmed: false,
+            style_picker: None,
             error: None,
         }
     }
@@ -198,34 +257,62 @@ impl Editor {
     }
 
     pub fn insert(&mut self, text: &str) {
+        if self.style_picker.is_some() {
+            return;
+        }
         if self.cell.as_ref().is_some_and(|cell| cell.is_picker()) {
             return;
         }
-        let before = self.active_buffer().text.clone();
         let text = if matches!(self.target, Target::Create(_)) {
             text.replace(['\n', '\r'], " ")
         } else {
             text.to_owned()
         };
         self.active_buffer_mut().insert(&text);
-        if self.active_buffer().text != before {
-            self.confirmed = false;
-        }
     }
 
     pub fn key(&mut self, key: KeyEvent) {
-        if let Some(cell) = &mut self.cell {
-            let before = (
-                cell.fields
-                    .iter()
-                    .map(|f| f.text.clone())
-                    .collect::<Vec<_>>(),
-                cell.checked.clone(),
-            );
-            cell.key(key);
-            if before.0.iter().ne(cell.fields.iter().map(|f| &f.text)) || before.1 != cell.checked {
-                self.confirmed = false;
+        if let Some(picker) = &mut self.style_picker {
+            match key.code {
+                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Down => picker.selected = (picker.selected + 1).min(3),
+                KeyCode::Char(' ') => {
+                    picker.checked[picker.selected] =
+                        Some(picker.checked[picker.selected] != Some(true))
+                }
+                KeyCode::Enter => {
+                    let styles = picker.checked;
+                    self.style_picker = None;
+                    self.active_buffer_mut().apply_styles(styles);
+                }
+                KeyCode::Esc => self.style_picker = None,
+                _ => {}
             }
+            return;
+        }
+        if self.active_buffer().rich.is_some() {
+            if key.code == KeyCode::F(10) && key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.style_picker = Some(StylePicker {
+                    selected: 0,
+                    checked: self.active_buffer().style_states(),
+                });
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let index = match key.code {
+                    KeyCode::Char('b' | 'B') => Some(0),
+                    KeyCode::Char('i' | 'I') => Some(1),
+                    KeyCode::Char('u' | 'U') => Some(2),
+                    _ => None,
+                };
+                if let Some(index) = index {
+                    self.active_buffer_mut().toggle_style(index);
+                    return;
+                }
+            }
+        }
+        if let Some(cell) = &mut self.cell {
+            cell.key(key);
             return;
         }
         if let Some(row) = &mut self.row {
@@ -240,12 +327,8 @@ impl Editor {
             self.cycle_kind();
             return;
         }
-        let before = self.active_buffer().text.clone();
         let multiline = !matches!(self.target, Target::Create(_));
         self.active_buffer_mut().key(key, multiline);
-        if self.active_buffer().text != before {
-            self.confirmed = false;
-        }
     }
 
     pub fn character_count(&self) -> usize {
@@ -268,35 +351,10 @@ impl Editor {
                     .cells
                     .iter()
                     .zip(block.table_cells.as_ref().unwrap())
-                    .any(|(draft, original)| draft.text != original.text),
-                None => self.buffer.text != block.text,
+                    .any(|(draft, original)| draft.text != original.text || draft.rich_changed()),
+                None => self.buffer.text != block.text || self.buffer.rich_changed(),
             },
             _ => true,
-        }
-    }
-
-    pub fn needs_formatting_confirmation(&self) -> bool {
-        if self.confirmed {
-            return false;
-        }
-        match &self.target {
-            Target::DatabaseCell(target) => {
-                let cell = self.cell.as_ref().unwrap();
-                let value =
-                    crate::database::property(&target.row, &target.column.id, &target.column.name);
-                matches!(cell.kind.as_str(), "title" | "rich_text")
-                    && crate::model::TableCell::from_value(&value[&cell.kind]).styled
-                    && self.changed()
-            }
-            Target::Edit(block) => match &self.row {
-                Some(row) => row
-                    .cells
-                    .iter()
-                    .zip(block.table_cells.as_ref().unwrap())
-                    .any(|(draft, original)| original.styled && draft.text != original.text),
-                None => block.styled && self.changed(),
-            },
-            _ => false,
         }
     }
 
@@ -319,18 +377,18 @@ impl Editor {
             Target::Edit(original) => match &self.row {
                 Some(row) => Write::UpdateTableRow {
                     original: original.clone(),
-                    cells: row.cells.iter().map(|cell| cell.text.clone()).collect(),
+                    cells: row.cells.iter().map(Buffer::rich_text).collect(),
                 },
                 None => Write::Update {
                     original: original.clone(),
-                    text: Some(self.buffer.text.clone()),
+                    text: Some(self.buffer.rich_text()),
                 },
             },
             Target::Append { parent, position } => Write::Append {
                 parent: parent.clone(),
                 position: position.clone(),
                 kind: self.kind,
-                text: self.buffer.text.clone(),
+                text: self.buffer.rich_text(),
             },
             Target::Create(parent) => {
                 if self.buffer.text.trim().is_empty() {
@@ -364,18 +422,13 @@ mod tests {
         editor.key(KeyCode::BackTab.into());
         editor.insert("\r\n🦀\t\x1b");
         assert!(editor.active_buffer().text.ends_with("\n🦀    "));
-        assert!(!editor.needs_formatting_confirmation());
         editor.key(KeyCode::Tab.into());
         assert_eq!(editor.active_buffer().cursor, cursor);
         editor.key(KeyCode::Enter.into());
-        assert!(editor.needs_formatting_confirmation());
-        editor.confirmed = true;
         editor.key(KeyCode::Left.into());
         editor.key(KeyCode::Tab.into());
-        assert!(editor.confirmed);
         editor.key(KeyCode::BackTab.into());
         editor.key(KeyCode::Backspace.into());
-        assert!(!editor.confirmed);
         editor.key(KeyCode::BackTab.into());
         editor.key(KeyCode::BackTab.into());
         assert_eq!(editor.row.as_ref().unwrap().active, 2);
@@ -384,7 +437,7 @@ mod tests {
             panic!("wrong write");
         };
         assert_eq!(cells.len(), 3);
-        assert_eq!(cells[2], "empty no longer");
+        assert_eq!(cells[2].plain(), "empty no longer");
     }
 
     #[test]

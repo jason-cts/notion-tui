@@ -64,7 +64,6 @@ pub enum Message {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Confirm {
-    Formatting,
     Discard,
     Quit,
     Delete,
@@ -437,17 +436,18 @@ impl App {
         if self.saving {
             return;
         }
+        if let Some(editor) = &mut self.editor
+            && editor.style_picker.is_some()
+            && self.confirm.is_none()
+        {
+            editor.key(key);
+            return;
+        }
         if let Some(confirm) = self.confirm {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.confirm = None;
                     match confirm {
-                        Confirm::Formatting => {
-                            if let Some(e) = &mut self.editor {
-                                e.confirmed = true;
-                            }
-                            self.save_editor();
-                        }
                         Confirm::Discard => self.editor = None,
                         Confirm::Quit => self.quit = true,
                         Confirm::Delete => self.delete_block(),
@@ -755,10 +755,6 @@ impl App {
         let Some(editor) = &self.editor else {
             return;
         };
-        if editor.needs_formatting_confirmation() {
-            self.confirm = Some(Confirm::Formatting);
-            return;
-        }
         if !editor.changed() {
             self.editor = None;
             self.status = "No changes".into();

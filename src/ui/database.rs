@@ -175,7 +175,12 @@ pub(super) fn render_cell_editor(frame: &mut Frame, editor: &Editor, saving: boo
             }
         }
     } else {
-        render_buffer(frame, &cell.fields[0], body, cursor && !saving);
+        render_buffer(
+            frame,
+            &cell.fields[0],
+            body,
+            cursor && !saving && editor.style_picker.is_none(),
+        );
     }
     let hint = if saving {
         "Saving… please wait"
@@ -183,17 +188,22 @@ pub(super) fn render_cell_editor(frame: &mut Frame, editor: &Editor, saving: boo
         "↑/↓ choose · Space/Enter select · Ctrl-S save · Esc cancel"
     } else if cell.kind == "date" {
         "Tab fields · Ctrl-D clear · Ctrl-S save · Esc cancel"
-    } else {
+    } else if cell.fields[0].rich.is_none() {
         "Ctrl-S save · Esc cancel · empty value clears"
+    } else {
+        "Ctrl-S save · Esc cancel · Shift+F10 styles · empty value clears"
     };
     frame.render_widget(
-        Paragraph::new(clean(editor.error.as_deref().unwrap_or(hint)))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(if editor.error.is_some() {
-                ERROR
-            } else {
-                ACCENT
-            })),
+        Paragraph::new(style_status(
+            &cell.fields[0],
+            clean(editor.error.as_deref().unwrap_or(hint)),
+        ))
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(if editor.error.is_some() {
+            ERROR
+        } else {
+            ACCENT
+        })),
         Rect::new(inner.x, body.bottom(), inner.width, footer_height),
     );
 }

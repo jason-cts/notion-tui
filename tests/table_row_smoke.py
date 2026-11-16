@@ -108,13 +108,10 @@ try:
     wait_for("Styled")
     paste(" changed")
     send("\x13")
-    wait_for("Unchanged cells keep their formatting")
-    send("y")
     wait_for("Demo is read-only")
     paste(" again")
     send("\x13")
-    wait_for("Unchanged cells keep their formatting")
-    send("n")
+    wait_for("Demo is read-only")
     size[:] = [12, 45]
     resize()
     wait_for("Cell 1/3")
@@ -127,7 +124,7 @@ try:
     send("yq")
     assert process.wait(timeout=10) == 0
     assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
-    print("Table-row PTY smoke passed: cells, Unicode, paste, Backspace, formatting confirmation, retained drafts, narrow layout, terminal restoration")
+    print("Table-row PTY smoke passed: cells, Unicode, paste, Backspace, style preservation, retained drafts, narrow layout, terminal restoration")
 finally:
     if process.poll() is None:
         process.kill()

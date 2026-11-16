@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 use crate::auth::{AuthError, OAuthSession, is_unauthorized};
 use crate::database::{DatabaseData, DatabaseMeta};
 use crate::model::{
-    BlockItem, InsertPosition, Kind, PageItem, append_payload, table_row_payload, update_payload,
+    BlockItem, InsertPosition, Kind, PageItem, RichText, append_payload, table_row_payload,
+    update_payload,
 };
 use rusticnotion::models::view::View;
 
@@ -31,17 +32,17 @@ pub enum Write {
     },
     Update {
         original: BlockItem,
-        text: Option<String>,
+        text: Option<RichText>,
     },
     UpdateTableRow {
         original: BlockItem,
-        cells: Vec<String>,
+        cells: Vec<RichText>,
     },
     Append {
         parent: String,
         position: InsertPosition,
         kind: Kind,
-        text: String,
+        text: RichText,
     },
     Create {
         parent: String,
@@ -420,7 +421,7 @@ impl NotionService for ApiService {
                 }
                 self.patch(
                     &format!("/blocks/{}", original.id),
-                    update_payload(&original, text.as_deref()),
+                    update_payload(&original, text.as_ref()),
                 )
                 .await?;
             }
@@ -533,7 +534,7 @@ impl NotionService for DemoService {
                 BlockItem::from_value(
                     &json!({"id":if children { "nested".into() } else { format!("demo-{i}") },
                 "type":kind,"last_edited_time":"demo","has_children":children,
-                kind:{"rich_text":[{"type":"text","plain_text":text}],"checked":false}}),
+                kind:{"rich_text":[{"type":"text","plain_text":text,"text":{"content":text}}],"checked":false}}),
                 )
             })
             .collect();
@@ -545,15 +546,15 @@ impl NotionService for DemoService {
         } else {
             blocks.push(BlockItem::from_value(
                 &json!({"id":"demo-rich-text", "type":"paragraph", "paragraph":{"rich_text":[
-                    {"type":"text","plain_text":"Bold", "annotations":{"bold":true}},
-                    {"type":"text","plain_text":" / "},
-                    {"type":"text","plain_text":"italic", "annotations":{"italic":true}},
-                    {"type":"text","plain_text":" / "},
-                    {"type":"text","plain_text":"underline", "annotations":{"underline":true}},
-                    {"type":"text","plain_text":" / "},
-                    {"type":"text","plain_text":"strike", "annotations":{"strikethrough":true}},
-                    {"type":"text","plain_text":" / "},
-                    {"type":"text","plain_text":"Google", "href":"https://www.google.com/"}
+                    {"type":"text","plain_text":"Bold","text":{"content":"Bold"}, "annotations":{"bold":true}},
+                    {"type":"text","plain_text":" / ","text":{"content":" / "}},
+                    {"type":"text","plain_text":"italic","text":{"content":"italic"}, "annotations":{"italic":true}},
+                    {"type":"text","plain_text":" / ","text":{"content":" / "}},
+                    {"type":"text","plain_text":"underline","text":{"content":"underline"}, "annotations":{"underline":true}},
+                    {"type":"text","plain_text":" / ","text":{"content":" / "}},
+                    {"type":"text","plain_text":"strike","text":{"content":"strike"}, "annotations":{"strikethrough":true}},
+                    {"type":"text","plain_text":" / ","text":{"content":" / "}},
+                    {"type":"text","plain_text":"Google", "href":"https://www.google.com/", "text":{"content":"Google","link":{"url":"https://www.google.com/"}}}
                 ]}}),
             ));
             blocks.insert(blocks.len().saturating_sub(1),BlockItem::from_value(&json!({"id":"demo-database","type":"child_database","child_database":{"title":"Task database"},"has_children":false})));

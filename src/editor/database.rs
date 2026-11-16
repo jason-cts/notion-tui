@@ -139,7 +139,16 @@ impl CellDraft {
         Self {
             kind: target.kind.clone(),
             initial_fields: fields.clone(),
-            fields: fields.into_iter().map(Buffer::new).collect(),
+            fields: if matches!(kind, "title" | "rich_text") {
+                vec![Buffer::from_rich(
+                    TableCell::from_value(value)
+                        .input
+                        .as_deref()
+                        .unwrap_or_default(),
+                )]
+            } else {
+                fields.into_iter().map(Buffer::new).collect()
+            },
             active: 0,
             choices,
             initial_checked: checked.clone(),
@@ -160,6 +169,7 @@ impl CellDraft {
             .iter()
             .map(|f| &f.text)
             .ne(self.initial_fields.iter())
+            || self.fields.iter().any(Buffer::rich_changed)
             || self.checked != self.initial_checked
     }
 
@@ -202,7 +212,7 @@ impl CellDraft {
                 if text.chars().count() > 100_000 {
                     return Err("Text is limited to 100,000 characters");
                 }
-                Ok(crate::model::rich_text(text))
+                Ok(json!(self.fields[0].rich_text()))
             }
             "number" if text.trim().is_empty() => Ok(Value::Null),
             "number" => text
@@ -323,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn text_editing_preserves_drafts_and_requires_confirmation_only_after_changes() {
+    fn text_editing_preserves_drafts_styles_and_links() {
         for kind in ["title", "rich_text"] {
             let target = target(
                 kind,
@@ -331,19 +341,15 @@ mod tests {
             );
             let mut e = Editor::new(Target::DatabaseCell(Box::new(target)));
             assert!(!e.changed());
-            assert!(!e.needs_formatting_confirmation());
             e.insert("\r\n你好🦀");
-            assert!(e.needs_formatting_confirmation());
-            e.confirmed = true;
             e.key(KeyCode::Left.into());
-            assert!(!e.needs_formatting_confirmation());
             e.insert("x");
-            assert!(e.needs_formatting_confirmation());
             let crate::service::Write::UpdateDatabaseCell { value, .. } = e.write().unwrap() else {
                 panic!()
             };
             assert_eq!(value[0]["text"]["content"], e.active_buffer().text);
-            assert!(value[0].get("annotations").is_none());
+            assert_eq!(value[0]["annotations"]["bold"], true);
+            assert_eq!(value[0]["text"]["link"]["url"], "https://example.com");
             e.cell.as_mut().unwrap().fields[0] = Buffer::new("🦀".repeat(2001));
             assert_eq!(
                 e.cell
@@ -356,6 +362,31 @@ mod tests {
                     .len(),
                 2
             );
+        }
+    }
+
+    #[test]
+    fn title_and_rich_text_save_formatting_only_changes() {
+        for kind in ["title", "rich_text"] {
+            let original = target(
+                kind,
+                json!([{"type":"text","text":{"content":"Hello","link":{"url":"https://example.com/"}},"annotations":{"code":true,"color":"red"}}]),
+            );
+            let mut editor = Editor::new(Target::DatabaseCell(Box::new(original)));
+            editor.key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+            editor.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
+            assert!(editor.changed());
+            let crate::service::Write::UpdateDatabaseCell { value, .. } = editor.write().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(value[0]["annotations"]["italic"], true);
+            assert_eq!(value[0]["annotations"]["code"], true);
+            assert_eq!(value[0]["annotations"]["color"], "red");
+            assert_eq!(value[0]["text"]["link"]["url"], "https://example.com/");
+            let reopened =
+                Buffer::from_rich(TableCell::from_value(&value).input.as_deref().unwrap());
+            assert_eq!(reopened.style_states()[1], Some(true));
         }
     }
 

@@ -11,7 +11,10 @@ mod ui;
 
 use anyhow::{Result, bail};
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
 };
 use futures_util::StreamExt;
@@ -21,11 +24,16 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-struct TerminalGuard;
+struct TerminalGuard {
+    enhanced_keys: bool,
+}
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = io::stdout().write_all(hyperlinks::CLOSE);
         let _ = execute!(io::stdout(), DisableBracketedPaste);
+        if self.enhanced_keys {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         ratatui::restore();
     }
 }
@@ -73,9 +81,16 @@ async fn main() -> Result<()> {
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = app::App::new(service, tx.clone(), demo);
-    let _guard = TerminalGuard;
+    let mut guard = TerminalGuard {
+        enhanced_keys: false,
+    };
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableBracketedPaste)?;
+    guard.enhanced_keys = execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok();
     // Some terminal environments coalesce resize notifications. Poll dimensions
     // on a modest cadence as well; ratatui only writes cells that changed.
     let mut redraw = tokio::time::interval(std::time::Duration::from_millis(250));

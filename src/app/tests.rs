@@ -21,6 +21,52 @@ fn ctrl_s() -> KeyEvent {
     KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
 }
 
+#[tokio::test]
+async fn formatting_only_save_retains_selection_styles_and_draft_on_failure() {
+    let (mut app, mut rx) = app();
+    app.key(KeyCode::Char('e').into());
+    app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+    app.key(KeyEvent::new(KeyCode::F(10), KeyModifiers::SHIFT));
+    app.key(KeyCode::Char(' ').into());
+    app.paste("ignored");
+    app.key(ctrl_s());
+    assert!(!app.saving);
+    assert!(rx.try_recv().is_err());
+    app.key(KeyCode::Enter.into());
+    let original = app.editor.as_ref().unwrap().buffer.clone();
+    assert_eq!(original.text, "Hello");
+    assert_eq!(original.style_states()[0], Some(true));
+    assert!(app.editor.as_ref().unwrap().changed());
+    app.key(ctrl_s());
+    assert!(app.saving);
+    app.receive(rx.recv().await.unwrap());
+    let retained = &app.editor.as_ref().unwrap().buffer;
+    assert_eq!(retained.text, original.text);
+    assert_eq!(retained.cursor, original.cursor);
+    assert_eq!(retained.selection(), original.selection());
+    assert_eq!(retained.rich_text(), original.rich_text());
+    assert!(app.editor.as_ref().unwrap().error.is_some());
+    assert!(app.confirm.is_none());
+}
+
+#[test]
+fn table_cells_keep_independent_styles_and_selection() {
+    let mut editor = Editor::new(Target::Edit(crate::model::tests::table_row()));
+    editor.key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+    editor.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    let first = editor.active_buffer().clone();
+    editor.key(KeyCode::Tab.into());
+    editor.key(KeyCode::Home.into());
+    editor.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    let second = editor.active_buffer().style_states();
+    editor.key(KeyCode::BackTab.into());
+    assert_eq!(editor.active_buffer().selection(), first.selection());
+    assert_eq!(editor.active_buffer().style_states(), first.style_states());
+    editor.key(KeyCode::Tab.into());
+    assert_eq!(editor.active_buffer().style_states(), second);
+    assert!(editor.changed());
+}
+
 async fn drain_content(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while app.loading_content {
@@ -456,10 +502,9 @@ async fn table_editing_keeps_failed_drafts_and_restores_cells_after_sorted_reloa
     app.key(KeyCode::Char('e').into());
     let buffer = &mut app.editor.as_mut().unwrap().cell.as_mut().unwrap().fields[0];
     *buffer = Buffer::new("ZZZ".into());
-    app.key(ctrl_s());
-    assert!(matches!(app.confirm, Some(Confirm::Formatting)));
     service.fail.store(true, Ordering::SeqCst);
-    app.key(KeyCode::Char('y').into());
+    app.key(ctrl_s());
+    assert!(app.confirm.is_none());
     app.receive(rx.recv().await.unwrap());
     assert!(!app.saving);
     assert_eq!(app.editor.as_ref().unwrap().active_buffer().text, "ZZZ");
@@ -686,7 +731,7 @@ fn append_captures_the_selected_sibling_and_its_parent() {
     app.editor.as_mut().unwrap().buffer.insert("new sibling");
     assert!(matches!(app.editor.as_ref().unwrap().write().unwrap(),
         Write::Append { parent, position: InsertPosition::After(after), text, .. }
-        if parent == "page" && after == "middle" && text == "new sibling"));
+        if parent == "page" && after == "middle" && text.plain() == "new sibling"));
 
     app.editor = None;
     app.path.push(Location {
@@ -1012,20 +1057,15 @@ fn table_row_noop_closes_and_protected_rows_cannot_open() {
 }
 
 #[tokio::test]
-async fn table_row_failed_save_retains_all_cells_active_cursor_and_confirmation_scope() {
+async fn table_row_failed_save_retains_all_cells_and_active_cursor() {
     let (mut app, mut rx) = app();
     app.blocks = vec![crate::model::tests::table_row()];
     app.key(KeyCode::Char('e').into());
     app.paste(" first draft");
-    assert!(!app.editor.as_ref().unwrap().needs_formatting_confirmation());
     app.key(KeyCode::Tab.into());
     app.paste(" styled draft");
     app.key(ctrl_s());
-    assert!(app.confirm == Some(Confirm::Formatting));
-    app.key(KeyCode::Char('n').into());
-    assert!(!app.saving);
-    app.key(ctrl_s());
-    app.key(KeyCode::Char('y').into());
+    assert!(app.confirm.is_none());
     assert!(app.saving);
     let draft = app.editor.as_ref().unwrap().row.clone().unwrap();
     app.paste("must not arrive during save");
@@ -1047,8 +1087,8 @@ async fn table_row_failed_save_retains_all_cells_active_cursor_and_confirmation_
     app.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
     assert_eq!(app.editor.as_ref().unwrap().active_buffer().text, "你x");
     app.key(ctrl_s());
-    assert!(app.confirm == Some(Confirm::Formatting));
-    app.key(KeyCode::Char('n').into());
+    app.receive(rx.recv().await.unwrap());
+    assert!(app.confirm.is_none());
     app.key(KeyCode::Esc.into());
     app.key(KeyCode::Char('n').into());
     assert!(app.editor.is_some());
@@ -1092,17 +1132,16 @@ async fn saved_table_row_refresh_restores_selection_by_id() {
 }
 
 #[tokio::test]
-async fn formatting_confirmation_and_protected_runs() {
+async fn rich_text_saves_directly_and_protected_runs_stay_read_only() {
     let (mut app, _) = app();
-    app.blocks[0].styled = true;
     app.key(KeyCode::Char('e').into());
     app.paste(" revised");
     app.key(ctrl_s());
-    assert!(app.confirm == Some(Confirm::Formatting));
-    assert!(!app.saving);
-    app.key(KeyCode::Char('n').into());
+    assert!(app.confirm.is_none());
+    assert!(app.saving);
     assert!(app.editor.is_some());
     app.editor = None;
+    app.saving = false;
     app.blocks[0].protected = true;
     app.key(KeyCode::Char('e').into());
     assert!(app.editor.is_none());

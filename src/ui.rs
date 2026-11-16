@@ -119,6 +119,7 @@ impl Ui {
                 && editor.row.is_some()
             {
                 render_row_editor(frame, editor, app.saving, app.confirm.is_none());
+                render_style_picker(frame, editor);
                 render_confirmation(frame, app);
                 return;
             }
@@ -336,12 +337,16 @@ impl Ui {
                     frame,
                     &editor.buffer,
                     parts[0],
-                    !app.saving && app.confirm.is_none(),
+                    !app.saving && app.confirm.is_none() && editor.style_picker.is_none(),
                 );
                 let hint = editor
                     .error
                     .as_deref()
-                    .unwrap_or("Ctrl-S save · Esc cancel · Tab changes inserted block type");
+                    .unwrap_or(if editor.buffer.rich.is_some() {
+                        "Ctrl-S save · Esc cancel · Shift+F10 styles · Tab block type"
+                    } else {
+                        "Ctrl-S save · Esc cancel"
+                    });
                 frame.render_widget(
                     Paragraph::new(clean(hint))
                         .wrap(Wrap { trim: false })
@@ -354,17 +359,21 @@ impl Ui {
                 );
                 frame.render_widget(
                     Paragraph::new(if app.saving {
-                        "Saving… please wait".into()
+                        Line::raw("Saving… please wait")
                     } else {
-                        format!(
-                            "{} characters · Ctrl-S save",
-                            editor.buffer.text.chars().count()
+                        style_status(
+                            &editor.buffer,
+                            format!(
+                                "{} characters · Ctrl-S save",
+                                editor.buffer.text.chars().count()
+                            ),
                         )
                     })
                     .style(Style::default().fg(ACCENT)),
                     parts[2],
                 );
             }
+            render_style_picker(frame, editor);
         }
         render_confirmation(frame, app);
     }
@@ -517,7 +526,11 @@ impl Ui {
             "  CELL PICKERS  ↑/↓ choose; Space/Enter select; Ctrl-S save\n",
             "  DATE CELLS    Tab/Shift-Tab fields; Ctrl-D clears the date\n",
             "  Arrows/Home/End move the text cursor; Enter inserts a newline.\n\n",
-            "  Styled text requires confirmation before replacement.\n",
+            "  Shift+Arrows  Select text; typing replaces the selection\n",
+            "  Ctrl-B/I/U    Bold / italic / underline\n",
+            "  Shift+F10     Bold / italic / underline / strikethrough\n",
+            "  B I U S       Highlighted: on; ~: mixed; dim: off\n",
+            "  Ctrl-I needs enhanced keys; otherwise use Shift+F10.\n",
             "  Mentions, equations, and unsupported types cannot be edited.\n",
             "  Deleting a container includes its contents; restore in Notion Trash.\n",
             "  A failed save keeps your draft. Check Notion before retrying.\n\n",
@@ -540,25 +553,6 @@ fn render_confirmation(frame: &mut Frame, app: &App) {
             Confirm::Delete => {
                 render_delete_confirmation(frame, app);
                 return;
-            }
-            Confirm::Formatting
-                if app
-                    .editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.cell.is_some()) =>
-            {
-                "Saving replaces this cell's styles and links with plain text.\nOther properties are preserved.\n\nContinue? y / n"
-            }
-            Confirm::Formatting
-                if app
-                    .editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.row.is_some()) =>
-            {
-                "Changed cells will use plain text, replacing their styles and links.\nUnchanged cells keep their formatting.\n\nContinue? y / n"
-            }
-            Confirm::Formatting => {
-                "Saving replaces styled text and links with plain text.\nBlock color and child blocks are preserved.\n\nContinue? y / n"
             }
             Confirm::Discard => "Discard this draft?\n\ny discard · n keep editing",
             Confirm::Quit => "Quit and discard this draft?\n\ny quit · n keep editing",
@@ -664,7 +658,7 @@ fn render_row_editor(frame: &mut Frame, editor: &Editor, saving: bool, cursor: b
         .split(inner);
         frame.render_widget(
             Paragraph::new(clean(editor.error.as_deref().unwrap_or(
-                "Tab/Shift-Tab cells · Enter newline · Ctrl-S save · Esc cancel",
+                "Tab/Shift-Tab cells · Shift+F10 styles · Ctrl-S save · Esc cancel",
             )))
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(if editor.error.is_some() { ERROR } else { MUTED })),
@@ -672,13 +666,16 @@ fn render_row_editor(frame: &mut Frame, editor: &Editor, saving: bool, cursor: b
         );
         frame.render_widget(
             Paragraph::new(if saving {
-                "Saving… please wait".into()
+                Line::raw("Saving… please wait")
             } else {
-                format!(
-                    "Cell {}/{} · {} characters · Ctrl-S save",
-                    row.active + 1,
-                    row.cells.len(),
-                    editor.character_count()
+                style_status(
+                    editor.active_buffer(),
+                    format!(
+                        "Cell {}/{} · {} characters · Ctrl-S save",
+                        row.active + 1,
+                        row.cells.len(),
+                        editor.character_count()
+                    ),
                 )
             })
             .style(Style::default().fg(ACCENT)),
@@ -718,14 +715,88 @@ fn render_row_editor(frame: &mut Frame, editor: &Editor, saving: bool, cursor: b
             area
         };
         if active {
-            render_buffer(frame, &row.cells[index], text_area, cursor && !saving);
+            render_buffer(
+                frame,
+                &row.cells[index],
+                text_area,
+                cursor && !saving && editor.style_picker.is_none(),
+            );
         } else {
             frame.render_widget(
-                Paragraph::new(row.cells[index].text.as_str()).style(Style::default().fg(MUTED)),
+                Paragraph::new(row.cells[index].styled_text()).style(Style::default().fg(MUTED)),
                 text_area,
             );
         }
     }
+}
+
+fn style_status(buffer: &Buffer, suffix: String) -> Line<'static> {
+    if buffer.rich.is_none() {
+        return Line::raw(suffix);
+    }
+    let mut spans = vec![];
+    for (i, (name, state)) in ["B", "I", "U", "S"]
+        .into_iter()
+        .zip(buffer.style_states())
+        .enumerate()
+    {
+        let style = match state {
+            Some(true) => Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::REVERSED | crate::editor::rich::STYLE_MODIFIERS[i]),
+            Some(false) => Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            None => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        };
+        spans.push(Span::styled(
+            format!("{name}{} ", if state.is_none() { "~" } else { "" }),
+            style,
+        ));
+    }
+    spans.push(Span::raw(format!("· {suffix}")));
+    Line::from(spans)
+}
+
+fn render_style_picker(frame: &mut Frame, editor: &Editor) {
+    let Some(picker) = &editor.style_picker else {
+        return;
+    };
+    let area = popup(frame.area(), 46, 9);
+    frame.render_widget(Clear, area);
+    let block = panel("TEXT STYLE".into(), true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(inner);
+    let items: Vec<_> = crate::editor::rich::STYLE_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mark = match picker.checked[i] {
+                Some(true) => "[x]",
+                Some(false) => "[ ]",
+                None => "[-]",
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{mark} ")),
+                Span::styled(
+                    *name,
+                    Style::default().add_modifier(crate::editor::rich::STYLE_MODIFIERS[i]),
+                ),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        parts[0],
+        &mut state,
+    );
+    frame.render_widget(
+        Paragraph::new("↑/↓ choose · Space toggle\nEnter apply · Esc cancel")
+            .wrap(Wrap { trim: false }),
+        parts[1],
+    );
 }
 
 fn render_buffer(frame: &mut Frame, buffer: &Buffer, area: Rect, cursor: bool) {
@@ -736,7 +807,7 @@ fn render_buffer(frame: &mut Frame, buffer: &Buffer, area: Rect, cursor: bool) {
     let top = row.saturating_sub(usize::from(area.height.saturating_sub(1)));
     let left = col.saturating_sub(usize::from(area.width.saturating_sub(1)));
     frame.render_widget(
-        Paragraph::new(buffer.text.as_str())
+        Paragraph::new(buffer.styled_text())
             .scroll((
                 top.min(u16::MAX as usize) as u16,
                 left.min(u16::MAX as usize) as u16,
@@ -757,6 +828,75 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn editing_renders_combined_styles_selection_and_status() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut buffer = Buffer::from_rich(&crate::model::RichText::from("styled").0);
+        buffer.key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT), true);
+        for i in 0..4 {
+            buffer.toggle_style(i);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(50, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_buffer(frame, &buffer, Rect::new(0, 0, 50, 5), true);
+                frame.render_widget(
+                    Paragraph::new(style_status(&buffer, "characters".into())),
+                    Rect::new(0, 6, 50, 1),
+                );
+            })
+            .unwrap();
+        let rendered = terminal.backend().buffer();
+        let expected = Modifier::BOLD
+            | Modifier::ITALIC
+            | Modifier::UNDERLINED
+            | Modifier::CROSSED_OUT
+            | Modifier::REVERSED;
+        assert!(rendered[(0, 0)].modifier.contains(expected));
+        for (x, label) in [(0, "B"), (2, "I"), (4, "U"), (6, "S")] {
+            assert_eq!(rendered[(x, 6)].symbol(), label);
+            assert!(rendered[(x, 6)].modifier.contains(Modifier::REVERSED));
+        }
+        buffer.key(KeyCode::Right.into(), true);
+        assert!(buffer.selection().is_none());
+    }
+
+    #[test]
+    fn style_picker_and_mixed_status_render_on_small_screens() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut editor = Editor::new(Target::Append {
+            parent: "p".into(),
+            position: InsertPosition::End,
+        });
+        editor.insert("a");
+        editor.buffer.toggle_style(0);
+        editor.insert("b");
+        editor.key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+        assert_eq!(
+            style_status(&editor.buffer, String::new()).to_string(),
+            "B~ I U S · "
+        );
+        editor.key(KeyEvent::new(KeyCode::F(10), KeyModifiers::SHIFT));
+        for (width, height) in [(100, 30), (45, 20), (16, 7), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_style_picker(frame, &editor))
+                .unwrap();
+            if width >= 45 {
+                let symbols: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(symbols.contains("TEXT STYLE"));
+                assert!(symbols.contains("[-] Bold"));
+                assert!(symbols.contains("Strikethrough"));
+            }
+        }
+    }
 
     #[test]
     fn row_dialog_scrolls_active_cell_into_view_and_survives_tiny_terminals() {
