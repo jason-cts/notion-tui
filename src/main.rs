@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod cli;
+mod comments;
 mod database;
 mod editor;
 mod hyperlinks;
@@ -129,6 +130,7 @@ async fn main() -> Result<()> {
             }
         })?;
         hyperlink_output.emit(&mut io::stdout(), completed.buffer, &ui.links)?;
+        app.check_visible_comments(&ui.visible_blocks);
         tokio::select! {
             _ = redraw.tick() => {},
             event = events.next() => match event {

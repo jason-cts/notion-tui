@@ -11,6 +11,7 @@ use rusticnotion::{
 use serde_json::{Value, json};
 
 use crate::auth::{AuthError, OAuthSession, is_unauthorized};
+use crate::comments::{Comment, CommentWrite};
 use crate::database::{DatabaseData, DatabaseMeta};
 use crate::model::{
     BlockItem, InsertPosition, Kind, PageItem, RichText, append_payload, table_row_payload,
@@ -18,6 +19,7 @@ use crate::model::{
 };
 use rusticnotion::models::view::View;
 
+mod comments;
 pub(crate) mod database;
 mod relocation;
 pub use relocation::{Relocation, RelocationState};
@@ -54,6 +56,15 @@ pub enum Write {
 
 #[async_trait]
 pub trait NotionService: Send + Sync {
+    async fn has_comments(&self, _id: &str) -> Result<bool> {
+        bail!("Comments are unavailable in this service")
+    }
+    async fn comments(&self, _id: &str) -> Result<Vec<Comment>> {
+        bail!("Comments are unavailable in this service")
+    }
+    async fn comment_write(&self, _write: CommentWrite) -> Result<String> {
+        bail!("Comment changes are unavailable in this service")
+    }
     async fn search(&self, query: &str) -> Result<Vec<PageItem>>;
     async fn page(&self, id: &str) -> Result<PageItem>;
     async fn children(&self, id: &str) -> Result<Vec<BlockItem>>;
@@ -198,6 +209,32 @@ impl OAuthService {
 
 #[async_trait]
 impl NotionService for OAuthService {
+    async fn has_comments(&self, id: &str) -> Result<bool> {
+        self.read(|api| {
+            let id = id.to_owned();
+            async move { api.has_comments(&id).await }
+        })
+        .await
+    }
+    async fn comments(&self, id: &str) -> Result<Vec<Comment>> {
+        self.read(|api| {
+            let id = id.to_owned();
+            async move { api.comments(&id).await }
+        })
+        .await
+    }
+    async fn comment_write(&self, write: CommentWrite) -> Result<String> {
+        let (token, api) = self.client().await?;
+        match api.comment_write(write).await {
+            Err(error) if is_unauthorized(&error) => {
+                self.session.refresh(&token).await.context("Could not renew OAuth login. Comment draft retained; the write was not retried")?;
+                bail!(
+                    "OAuth login refreshed. Comment write was not retried; draft retained. Submit again when ready"
+                )
+            }
+            result => result,
+        }
+    }
     async fn relocate(&self, relocation: &mut Relocation) -> Result<String> {
         let (token, api) = self.client().await?;
         match api.relocate(relocation).await {
@@ -299,6 +336,15 @@ fn next_cursor<T: serde::Serialize>(
 
 #[async_trait]
 impl NotionService for ApiService {
+    async fn has_comments(&self, id: &str) -> Result<bool> {
+        self.comment_presence(id).await
+    }
+    async fn comments(&self, id: &str) -> Result<Vec<Comment>> {
+        self.list_comments(id).await
+    }
+    async fn comment_write(&self, write: CommentWrite) -> Result<String> {
+        self.mutate_comment(write).await
+    }
     async fn relocate(&self, relocation: &mut Relocation) -> Result<String> {
         self.relocate_block(relocation).await
     }
@@ -492,6 +538,15 @@ pub struct DemoService;
 
 #[async_trait]
 impl NotionService for DemoService {
+    async fn has_comments(&self, id: &str) -> Result<bool> {
+        Ok(!comments::demo_comments(id).is_empty())
+    }
+    async fn comments(&self, id: &str) -> Result<Vec<Comment>> {
+        Ok(comments::demo_comments(id))
+    }
+    async fn comment_write(&self, _write: CommentWrite) -> Result<String> {
+        bail!("Demo is read-only. Connect NOTION_API_TOKEN to change comments")
+    }
     async fn database(&self, id: &str) -> Result<DatabaseMeta> {
         Ok(database::demo_metadata(id))
     }

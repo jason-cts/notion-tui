@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+mod comments;
 mod database;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -25,6 +26,7 @@ const ERROR: Color = Color::Rgb(255, 154, 145);
 
 #[derive(Default)]
 pub struct Ui {
+    pub visible_blocks: Vec<String>,
     pages: ListState,
     block_offsets: std::collections::HashMap<String, usize>,
     database_offsets: std::collections::HashMap<String, usize>,
@@ -105,12 +107,22 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 impl Ui {
     pub fn draw(&mut self, frame: &mut Frame, app: &App) {
         self.links.clear();
+        self.visible_blocks.clear();
         let area = frame.area();
         frame.render_widget(
             Block::default().style(Style::default().bg(BG).fg(INK)),
             area,
         );
         if area.width < 16 || area.height < 7 {
+            if let Some(modal) = &app.comments {
+                comments::render_comments(frame, modal, app.saving);
+                if let Some(editor) = &app.editor {
+                    render_text_editor(frame, editor, app.saving, app.confirm.is_none());
+                    render_style_picker(frame, editor);
+                }
+                render_confirmation(frame, app);
+                return;
+            }
             if matches!(app.confirm, Some(Confirm::Delete | Confirm::Relocate)) {
                 render_confirmation(frame, app);
                 return;
@@ -203,7 +215,7 @@ impl Ui {
             Paragraph::new(
                 if app.database().is_some_and(crate::database::DatabaseState::is_table) { "arrows select cells  e edit  Enter icon opens page  Backspace parent  [ / ] views  < > more columns" }
                 else if app.database().is_some() { "[ / ] views  ←/→ columns  Enter page  Backspace parent  v details  o link  r refresh  q quit" }
-                else { "Tab panes  / search  Enter open  o link  v read  e edit  d delete  >/< indent/outdent  a after  A before  ? help  q quit" },
+                else { "Tab panes  / search  Enter open  c comments  o link  v read  e edit  d delete  >/< indent/outdent  a after  A before  ? help  q quit" },
             )
             .style(Style::default().fg(ACCENT)),
             Rect {
@@ -218,6 +230,7 @@ impl Ui {
             || app.editor.is_some()
             || app.confirm.is_some()
             || app.link_picker.is_some()
+            || app.comments.is_some()
         {
             self.links.clear();
         }
@@ -295,83 +308,17 @@ impl Ui {
                 true,
             );
         }
+        if let Some(modal) = &app.comments {
+            self.links.clear();
+            comments::render_comments(frame, modal, app.saving);
+        }
         if let Some(editor) = &app.editor {
             if editor.cell.is_some() {
                 database::render_cell_editor(frame, editor, app.saving, app.confirm.is_none());
             } else if editor.row.is_some() {
                 render_row_editor(frame, editor, app.saving, app.confirm.is_none());
             } else {
-                let area = popup(area, 100, frame.area().height.saturating_sub(4).min(30));
-                frame.render_widget(Clear, area);
-                let name = match &editor.target {
-                    Target::Edit(_) => "EDIT BLOCK",
-                    Target::DatabaseCell(_) => unreachable!("cell editor rendered separately"),
-                    Target::Append {
-                        position: InsertPosition::Start,
-                        ..
-                    } => "INSERT BLOCK · at beginning",
-                    Target::Append {
-                        position: InsertPosition::After(_),
-                        ..
-                    } => "INSERT BLOCK",
-                    Target::Append {
-                        position: InsertPosition::End,
-                        ..
-                    } => "INSERT BLOCK · first block",
-                    Target::Create(_) => "NEW CHILD PAGE",
-                };
-                frame.render_widget(
-                    panel(format!("{name} · {}", editor.kind.name()), true),
-                    area,
-                );
-                let parts = Layout::vertical([
-                    Constraint::Min(1),
-                    Constraint::Length(if editor.error.is_some() { 4 } else { 1 }),
-                    Constraint::Length(1),
-                ])
-                .split(area.inner(ratatui::layout::Margin {
-                    horizontal: 2,
-                    vertical: 1,
-                }));
-                render_buffer(
-                    frame,
-                    &editor.buffer,
-                    parts[0],
-                    !app.saving && app.confirm.is_none() && editor.style_picker.is_none(),
-                );
-                let hint = editor
-                    .error
-                    .as_deref()
-                    .unwrap_or(if editor.buffer.rich.is_some() {
-                        "Ctrl-S save · Esc cancel · Shift+F10 styles · Tab block type"
-                    } else {
-                        "Ctrl-S save · Esc cancel"
-                    });
-                frame.render_widget(
-                    Paragraph::new(clean(hint))
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(if editor.error.is_some() {
-                            ERROR
-                        } else {
-                            MUTED
-                        })),
-                    parts[1],
-                );
-                frame.render_widget(
-                    Paragraph::new(if app.saving {
-                        Line::raw("Saving… please wait")
-                    } else {
-                        style_status(
-                            &editor.buffer,
-                            format!(
-                                "{} characters · Ctrl-S save",
-                                editor.buffer.text.chars().count()
-                            ),
-                        )
-                    })
-                    .style(Style::default().fg(ACCENT)),
-                    parts[2],
-                );
+                render_text_editor(frame, editor, app.saving, app.confirm.is_none());
             }
             render_style_picker(frame, editor);
         }
@@ -440,11 +387,13 @@ impl Ui {
             return;
         }
         frame.render_widget(block, area);
+        let balloon_width = UnicodeWidthStr::width(comments::BALLOON) as u16;
+        let text_width = inner.width.saturating_sub(3 + balloon_width + 1);
         let rows: Vec<_> = app
             .block_labels()
             .iter()
             .map(|label| {
-                let mut lines = wrapped_block(label, inner.width.saturating_sub(3));
+                let mut lines = wrapped_block(label, text_width);
                 lines.push(RichLine::default());
                 lines
             })
@@ -477,6 +426,9 @@ impl Ui {
                 if y >= inner.bottom() {
                     return;
                 }
+                if row_index == 0 {
+                    self.visible_blocks.push(app.blocks[index].id.clone());
+                }
                 let row = Rect {
                     y,
                     height: 1,
@@ -492,12 +444,25 @@ impl Ui {
                     row,
                 );
                 let text_area = Rect {
-                    x: inner.x + 2,
-                    width: inner.width.saturating_sub(3),
+                    x: inner.x + 2.min(inner.width),
+                    width: text_width,
                     ..row
                 };
                 frame.render_widget(Paragraph::new(line.line()).style(style), text_area);
                 hyperlinks::record(&mut self.links, line, text_area);
+                if row_index == 0
+                    && inner.width >= balloon_width + 3
+                    && app.block_has_comments(&app.blocks[index].id)
+                {
+                    frame.render_widget(
+                        Paragraph::new(comments::BALLOON).style(style.fg(ACCENT)),
+                        Rect {
+                            x: inner.right() - balloon_width,
+                            width: balloon_width,
+                            ..row
+                        },
+                    );
+                }
                 y += 1;
             }
         }
@@ -517,6 +482,9 @@ impl Ui {
             "  < / >         More property columns to the left / right\n",
             "  r             Refresh focused pane v        Read full block\n",
             "  o             Open selected block's link in your browser\n",
+            "  c             Comments for selected block · 💬 marks comments\n",
+            "  COMMENTS      ↑/↓ choose; PgUp/PgDn scroll; a new; Enter reply\n",
+            "                e edit; d delete; r refresh; Esc close\n",
             "  q / Ctrl-C    Quit                 ?        Help\n\n",
             "  EDIT\n",
             "  e             Edit selected text block, table row, or database cell\n",
@@ -553,9 +521,99 @@ impl Ui {
     }
 }
 
+fn render_text_editor(frame: &mut Frame, editor: &Editor, saving: bool, active: bool) {
+    let area = popup(
+        frame.area(),
+        100,
+        frame.area().height.saturating_sub(4).min(30),
+    );
+    frame.render_widget(Clear, area);
+    let name = match &editor.target {
+        Target::Edit(_) => "EDIT BLOCK",
+        Target::Comment(crate::comments::CommentTarget::Edit(_)) => "EDIT COMMENT",
+        Target::Comment(crate::comments::CommentTarget::Discussion(_)) => "REPLY TO COMMENT",
+        Target::Comment(_) => "NEW COMMENT",
+        Target::DatabaseCell(_) => unreachable!("cell editor rendered separately"),
+        Target::Append {
+            position: InsertPosition::Start,
+            ..
+        } => "INSERT BLOCK · at beginning",
+        Target::Append {
+            position: InsertPosition::After(_),
+            ..
+        } => "INSERT BLOCK",
+        Target::Append {
+            position: InsertPosition::End,
+            ..
+        } => "INSERT BLOCK · first block",
+        Target::Create(_) => "NEW CHILD PAGE",
+    };
+    frame.render_widget(
+        panel(
+            if matches!(editor.target, Target::Comment(_)) {
+                name.into()
+            } else {
+                format!("{name} · {}", editor.kind.name())
+            },
+            true,
+        ),
+        area,
+    );
+    let parts = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(if editor.error.is_some() { 4 } else { 1 }),
+        Constraint::Length(1),
+    ])
+    .split(area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    }));
+    render_buffer(
+        frame,
+        &editor.buffer,
+        parts[0],
+        !saving && active && editor.style_picker.is_none(),
+    );
+    let hint = editor
+        .error
+        .as_deref()
+        .unwrap_or(if matches!(editor.target, Target::Comment(_)) {
+            "Ctrl-S submit · Esc cancel · Shift+F10 styles"
+        } else if editor.buffer.rich.is_some() {
+            "Ctrl-S save · Esc cancel · Shift+F10 styles · Tab block type"
+        } else {
+            "Ctrl-S save · Esc cancel"
+        });
+    frame.render_widget(
+        Paragraph::new(clean(hint))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(if editor.error.is_some() { ERROR } else { MUTED })),
+        parts[1],
+    );
+    frame.render_widget(
+        Paragraph::new(if saving {
+            Line::raw("Saving… please wait")
+        } else {
+            style_status(
+                &editor.buffer,
+                format!(
+                    "{} characters · Ctrl-S save",
+                    editor.buffer.text.chars().count()
+                ),
+            )
+        })
+        .style(Style::default().fg(ACCENT)),
+        parts[2],
+    );
+}
+
 fn render_confirmation(frame: &mut Frame, app: &App) {
     if let Some(confirm) = app.confirm {
         let text = match confirm {
+            Confirm::DeleteComment => {
+                comments::render_comment_confirmation(frame, app);
+                return;
+            }
             Confirm::Delete => {
                 render_delete_confirmation(frame, app);
                 return;

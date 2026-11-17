@@ -3,7 +3,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
+mod comments;
 mod database;
+pub use comments::{CommentIndicators, CommentsModal};
 mod relocation;
 pub use relocation::PendingRelocation;
 
@@ -36,6 +38,24 @@ pub struct Location {
 }
 
 pub enum Message {
+    CommentPresence {
+        id: String,
+        request: u64,
+        generation: u64,
+        retry_after: Option<std::time::Duration>,
+        result: Result<bool, String>,
+    },
+    CommentsLoaded {
+        id: String,
+        generation: u64,
+        result: Result<Vec<crate::comments::Comment>, String>,
+    },
+    CommentSaved {
+        id: String,
+        generation: u64,
+        deleting: bool,
+        result: Result<String, String>,
+    },
     DatabaseMeta {
         id: String,
         generation: u64,
@@ -70,6 +90,7 @@ pub enum Message {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Confirm {
+    DeleteComment,
     Discard,
     Quit,
     Delete,
@@ -93,6 +114,9 @@ struct BlockSelection {
 }
 
 pub struct App {
+    pub comments: Option<CommentsModal>,
+    pub comment_indicators: CommentIndicators,
+    comment_generation: u64,
     pub databases: HashMap<String, DatabaseState>,
     metadata_pending: HashSet<String>,
     metadata_generations: HashMap<String, u64>,
@@ -135,6 +159,9 @@ pub struct App {
 impl App {
     pub fn new(service: Service, sender: mpsc::UnboundedSender<Message>, demo: bool) -> Self {
         Self {
+            comments: None,
+            comment_indicators: CommentIndicators::default(),
+            comment_generation: 0,
             service,
             sender,
             demo,
@@ -208,6 +235,7 @@ impl App {
             return;
         };
         self.content_generation += 1;
+        self.reset_comment_checks();
         if self.selection_after_back.as_deref() != Some(location.id.as_str()) {
             self.selection_after_back = None;
         }
@@ -283,6 +311,24 @@ impl App {
 
     pub fn receive(&mut self, message: Message) {
         match message {
+            Message::CommentPresence {
+                id,
+                request,
+                generation,
+                retry_after,
+                result,
+            } => self.receive_comment_presence(id, request, generation, result, retry_after),
+            Message::CommentsLoaded {
+                id,
+                generation,
+                result,
+            } => self.receive_comments(id, generation, result),
+            Message::CommentSaved {
+                id,
+                generation,
+                deleting,
+                result,
+            } => self.receive_comment_saved(id, generation, deleting, result),
             Message::Relocated { pending, result } => self.receive_relocation(*pending, result),
             Message::DatabaseMeta {
                 id,
@@ -487,6 +533,7 @@ impl App {
                         Confirm::Quit => self.quit = true,
                         Confirm::Delete => self.delete_block(),
                         Confirm::Relocate => self.relocate_block(),
+                        Confirm::DeleteComment => self.delete_comment(),
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -573,10 +620,14 @@ impl App {
             }
             return;
         }
+        if self.comments_key(key) {
+            return;
+        }
         if self.database_key(key) {
             return;
         }
         match key.code {
+            KeyCode::Char('c') if key.modifiers.is_empty() => self.open_comments(),
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => {
                 self.help = true;
@@ -599,6 +650,7 @@ impl App {
                 if self.focus == Focus::Pages {
                     self.start_search();
                 } else {
+                    self.invalidate_comment_indicators();
                     self.load();
                 }
             }
@@ -820,6 +872,16 @@ impl App {
             self.editor = None;
             self.status = "No changes".into();
             self.error = false;
+            return;
+        }
+        if matches!(editor.target, Target::Comment(_)) {
+            match editor.comment_write() {
+                Ok(write) => self.save_comment(write),
+                Err(error) => {
+                    self.editor.as_mut().unwrap().error = Some(error.into());
+                    self.fail(error);
+                }
+            }
             return;
         }
         match editor.write() {

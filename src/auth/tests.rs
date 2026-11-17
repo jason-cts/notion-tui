@@ -523,6 +523,81 @@ async fn a_rejected_read_is_not_retried_indefinitely() {
 }
 
 #[tokio::test]
+async fn comment_reads_renew_oauth_and_share_the_rotated_client() {
+    let server = MockServer::start().await;
+    let (_directory, store) = saved_store().await;
+    Mock::given(method("GET"))
+        .and(path("/comments"))
+        .and(header("Authorization", "Bearer old"))
+        .respond_with(unauthorized())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/comments"))
+        .and(header("Authorization", "Bearer new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"object":"list","results":[],"has_more":false,"next_cursor":null}),
+        ))
+        .expect(2)
+        .mount(&server)
+        .await;
+    refresh_mock(&server).await;
+    let api = OAuthService::new(session(client(&server), store))
+        .await
+        .unwrap();
+    assert!(!api.has_comments("block").await.unwrap());
+    assert!(api.comments("block").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn comment_writes_renew_oauth_without_automatically_replaying() {
+    use crate::comments::{CommentTarget, CommentWrite};
+    let server = MockServer::start().await;
+    let (_directory, store) = saved_store().await;
+    Mock::given(method("POST"))
+        .and(path("/comments"))
+        .and(header("Authorization", "Bearer old"))
+        .respond_with(unauthorized())
+        .expect(1)
+        .mount(&server)
+        .await;
+    refresh_mock(&server).await;
+    let api = OAuthService::new(session(client(&server), store))
+        .await
+        .unwrap();
+    let write = CommentWrite::Save {
+        target: CommentTarget::Block("block".into()),
+        text: "draft".into(),
+    };
+    let error = api
+        .comment_write(write.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not retried"));
+    assert!(error.contains("draft retained"));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path() == "/comments")
+            .count(),
+        1
+    );
+    Mock::given(method("POST"))
+        .and(path("/comments"))
+        .and(header("Authorization", "Bearer new"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object":"comment","id":"saved"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(api.comment_write(write).await.unwrap(), "saved");
+}
+
+#[tokio::test]
 async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
     let server = MockServer::start().await;
     let (_directory, store) = saved_store().await;

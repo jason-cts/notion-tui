@@ -79,6 +79,7 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | `/` | Search page titles; Enter submits, Esc cancels |
 | `r` | Refresh the focused pane |
 | `v` | Open the full block in a scrollable reader |
+| `c` | Open comments for the selected block; 💬 at the right edge marks blocks with comments |
 | `o` | Open the selected block's external link in your browser; choose when it contains multiple links |
 | `e` | Edit a paragraph, heading, list item, to-do, simple-table row, or selected database property |
 | `d` | Delete the selected block after confirmation |
@@ -106,6 +107,14 @@ Notion bold, italic, underline, and strikethrough annotations render as terminal
 
 Consecutive numbered-list siblings count upward and restart after another block type. Nested list items indent and cycle through decimal, lowercase letters, and lowercase Roman numerals. Opening a child page resets the nesting context. The full-block reader uses the same numbering as the content pane.
 
+## Comments
+
+Press `c` on a content block to open its comments. Use ↑/↓ to select a comment, PageUp/PageDown to scroll, `a` to create a comment on the block, Enter to reply to the selected discussion, `e` to edit, `d` to delete, `r` to refresh, and Esc to close. Deletion requires `y`; `n` or Esc cancels. The rich-text editor supports multiline text, paste, selection, and the existing formatting controls. Ctrl-S submits; Esc asks before discarding. Failed writes retain the draft. Comments with mentions, equations, or unsupported rich text can be read and replied to but cannot be edited here. Attachment counts are displayed; uploading attachments is not supported.
+
+The 💬 speech balloon (U+1F4AC) appears at the right edge of the first line of blocks with open comments. Visible blocks are checked in the background, with cached results and rate-limited requests; scrolling checks newly visible blocks. Unknown or unavailable comment status has no indicator. Refresh the content pane with `r` to recheck it. Opening the modal and saving or deleting comments also updates the indicator.
+
+Enable **Read comments** and **Insert comments** in your Notion integration's capabilities. The public API lists unresolved comments; resolved discussions, resolve/reopen actions, and creating comments anchored to a selected text range are not supported here. API permissions govern editing and deletion; a connection can only delete comments it created. Comment writes are never automatically retried after OAuth renewal or an uncertain response: inspect Notion before retrying. Demo comments are read-only.
+
 ## Child databases
 
 Selecting a child database loads its saved view metadata and shows the layout in the content title, for example `child_database (list)`. Enter opens the database. The first supported saved view is selected initially; `[` and `]` switch views and the choice is remembered for this session. Each view uses its own data source, saved filters, and saved sorts through Notion's Views API.
@@ -124,7 +133,7 @@ Property matching accepts both raw IDs from saved views and percent-encoded IDs 
 
 Queries load all result pages and hydrate properties used by the view. Temporary query caches are deleted after loading; cleanup failure does not discard rows. Explicit rate-limit responses are retried up to three times using Notion's waiting interval. An expired query restarts once. These operations do not edit saved views, database schemas, or pages.
 
-The table-view compatibility fix for `frozen_column_index: -1` is implemented in the sibling `../rusticnotion` working tree. Until that revision is published to GitHub and adopted in `Cargo.lock`, use a temporary local override for development:
+The comment endpoints and models live in the sibling `../rusticnotion` working tree, along with the table-view compatibility fix for `frozen_column_index: -1`. Until the comment API revision is published to GitHub and adopted in `Cargo.lock`, use a temporary local override for development:
 
 ```sh
 cargo --config 'patch."https://github.com/jason-cts/rusticnotion.git".rusticnotion.path="../rusticnotion"' run -- --demo
@@ -151,6 +160,7 @@ Drafts and navigation state live in memory. Quitting discards them. During a sav
 - `src/app.rs`: navigation, modal state, asynchronous results, and stale-read rejection.
 - `src/editor.rs` and `src/editor/rich.rs`: text buffers, rich-text selection and styles, draft validation, and write intent.
 - `src/service.rs`: `NotionService`, rusticnotion reads/page creation, and a small reqwest block-write adapter.
+- `src/service/comments.rs`: application pagination, conflict checks, and error hints over rusticnotion's comment API; the library owns HTTP requests and wire models.
 - `src/auth.rs` and `src/auth/`: OAuth authorization, callback handling, rotating sessions, and private credential storage.
 - `src/model.rs`: display models and minimal block-write payloads.
 - `src/database.rs` and the database submodules under app/service/ui: saved views, property formatting, grouping, navigation, and rendering.

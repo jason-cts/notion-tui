@@ -3,6 +3,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    comments::{CommentTarget, CommentWrite, validate_text},
     model::{BlockItem, InsertPosition, Kind},
     service::Write,
 };
@@ -14,6 +15,7 @@ use rich::{RichDraft, StylePicker};
 
 #[derive(Clone, Debug)]
 pub enum Target {
+    Comment(CommentTarget),
     Edit(BlockItem),
     DatabaseCell(Box<CellTarget>),
     Append {
@@ -216,6 +218,13 @@ impl Editor {
             _ => (String::new(), Kind::Paragraph),
         };
         let buffer = match &target {
+            Target::Comment(CommentTarget::Edit(original)) => Buffer::from_rich(
+                original
+                    .input
+                    .as_ref()
+                    .map_or(&[], |text| text.0.as_slice()),
+            ),
+            Target::Comment(_) => Buffer::from_rich(&[]),
             Target::Edit(block) if row.is_none() => Buffer::from_rich(
                 &block
                     .input
@@ -323,7 +332,7 @@ impl Editor {
                     % row.cells.len();
                 return;
             }
-        } else if key.code == KeyCode::Tab {
+        } else if key.code == KeyCode::Tab && !matches!(self.target, Target::Comment(_)) {
             self.cycle_kind();
             return;
         }
@@ -346,6 +355,7 @@ impl Editor {
             return cell.changed();
         }
         match &self.target {
+            Target::Comment(CommentTarget::Edit(_)) => self.buffer.rich_changed(),
             Target::Edit(block) => match &self.row {
                 Some(row) => row
                     .cells
@@ -370,6 +380,7 @@ impl Editor {
             return Err("Text is limited to 100,000 characters per block");
         }
         Ok(match &self.target {
+            Target::Comment(_) => return Err("Use the comment save action"),
             Target::DatabaseCell(original) => Write::UpdateDatabaseCell {
                 original: original.clone(),
                 value: self.cell.as_ref().unwrap().value()?,
@@ -402,6 +413,18 @@ impl Editor {
                     title: self.buffer.text.clone(),
                 }
             }
+        })
+    }
+
+    pub fn comment_write(&self) -> Result<CommentWrite, &'static str> {
+        let Target::Comment(target) = &self.target else {
+            return Err("No comment draft to save");
+        };
+        let text = self.buffer.rich_text();
+        validate_text(&text)?;
+        Ok(CommentWrite::Save {
+            target: target.clone(),
+            text,
         })
     }
 }
