@@ -73,7 +73,7 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | `g`/`G`, Home/End | First/last item |
 | Tab | Switch pages/content panes |
 | Enter | Open a page or a block's children |
-| Backspace | Return to parent |
+| Backspace | Return to parent, restoring its selection and scroll position |
 | `[` / `]` | Previous/next saved database view |
 | ←/→ | Move between board columns or database table cells |
 | `/` | Search page titles; Enter submits, Esc cancels |
@@ -82,6 +82,7 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | `o` | Open the selected block's external link in your browser; choose when it contains multiple links |
 | `e` | Edit a paragraph, heading, list item, to-do, simple-table row, or selected database property |
 | `d` | Delete the selected block after confirmation |
+| `>` / `<` | Indent / outdent the selected leaf block after confirmation |
 | Space | Toggle a to-do without changing its rich text |
 | `a` | Insert a block immediately after the selected block; create the first block in an empty location |
 | Shift+A | Insert a block immediately before the selected block; create the first block in an empty location |
@@ -94,6 +95,10 @@ The editor supports multiline text, Unicode, bracketed paste, arrows, and Home/E
 Shift+Arrow and Shift+Home/End select text in block editors, simple-table cells, and database title/rich-text fields. Formatting applies to selected text; without a selection it changes subsequent typing. Typing, paste, Backspace, and Delete replace or remove the selection. The status line shows `B I U S`: highlighted styles are enabled, dim styles are off, and `~` marks mixed formatting. In the Shift+F10 dialog, use Up/Down to choose, Space to toggle, Enter to apply, and Esc to cancel. Ctrl+I works when the terminal distinguishes it from Tab through enhanced key reporting; otherwise Tab keeps its existing behavior and italic is available through Shift+F10. Existing links, code, and colors are preserved; link/color/code editing is not provided. Search, scalar properties, and the new-child-page title dialog remain plain text.
 
 Insertion stays at the current nesting level: `a` inserts directly after the selected block, and Shift+A inserts directly before it. Both shortcuts create the first block in an empty location. Saving refreshes the list and selects the inserted block. Failed saves retain the draft and its insertion point.
+
+Press `>` to make a block the last child of its previous sibling, or `<` to place it immediately after its parent at the grandparent level. Confirm with `y`; `n` or Esc cancels. The app opens the destination and selects the resulting block. The first sibling cannot be indented, and top-level blocks cannot be outdented. This supports leaf paragraphs, bullets, numbered items, and to-dos with editable text. Blocks with children, mentions/equations, headings, tables, pages, and databases cannot be moved. Nesting targets are paragraphs, list items, to-dos, toggles, quotes, and callouts.
+
+Notion's public API cannot move ordinary blocks, so indent/outdent creates a replacement and then moves the original to Trash. Text formatting, links within the text, block color, and checked state are preserved. The replacement has a new ID; history and comments stay with the original, and links to the original block still point there. The confirmation explains this before every operation. If a known replacement exists after a failure, select the original and repeat `>` or `<` to resume that pending move without another copy. If the copy response was lost, further moves of that source are blocked for the session: inspect Notion and resolve the copy manually before restarting. Writes are never automatically replayed after OAuth renewal.
 
 Press `d` in a content-block list to review the selected block's type and text/title, then `y` to delete or `n`/Esc to cancel. Enter does not confirm. All block types can be deleted, including child pages, child databases, and containers with their contents. Deletion moves the block to Notion Trash, where it can be restored. Page search results and database records cannot be deleted from these panes. After deletion, the next block is selected, or the previous block when deleting the last item.
 

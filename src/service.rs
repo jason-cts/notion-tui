@@ -19,6 +19,8 @@ use crate::model::{
 use rusticnotion::models::view::View;
 
 pub(crate) mod database;
+mod relocation;
+pub use relocation::{Relocation, RelocationState};
 pub type Progress = Arc<dyn Fn(usize) + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -56,6 +58,9 @@ pub trait NotionService: Send + Sync {
     async fn page(&self, id: &str) -> Result<PageItem>;
     async fn children(&self, id: &str) -> Result<Vec<BlockItem>>;
     async fn write(&self, write: Write) -> Result<Option<PageItem>>;
+    async fn relocate(&self, _relocation: &mut Relocation) -> Result<String> {
+        bail!("Indent/outdent is unavailable in this service")
+    }
     async fn database(&self, _id: &str) -> Result<DatabaseMeta> {
         bail!("Database browsing is unavailable")
     }
@@ -110,6 +115,10 @@ impl ApiService {
         } else {
             "Save response unavailable; inspect Notion before retrying"
         })?;
+        self.write_response(response, deleting).await.map(|_| ())
+    }
+
+    async fn write_response(&self, response: reqwest::Response, deleting: bool) -> Result<Value> {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(AuthError::Unauthorized.into());
@@ -135,7 +144,7 @@ impl ApiService {
             }
             bail!("Notion {status}: {message}");
         }
-        Ok(())
+        Ok(body)
     }
 }
 
@@ -189,6 +198,21 @@ impl OAuthService {
 
 #[async_trait]
 impl NotionService for OAuthService {
+    async fn relocate(&self, relocation: &mut Relocation) -> Result<String> {
+        let (token, api) = self.client().await?;
+        match api.relocate(relocation).await {
+            Err(error) if is_unauthorized(&error) => {
+                self.session
+                    .refresh(&token)
+                    .await
+                    .context("Could not renew OAuth login. Indent/outdent was not retried")?;
+                bail!(
+                    "OAuth login refreshed. Indent/outdent was not retried; select the original block and confirm again"
+                )
+            }
+            result => result,
+        }
+    }
     async fn database(&self, id: &str) -> Result<DatabaseMeta> {
         self.read(|api| {
             let id = id.to_owned();
@@ -275,6 +299,9 @@ fn next_cursor<T: serde::Serialize>(
 
 #[async_trait]
 impl NotionService for ApiService {
+    async fn relocate(&self, relocation: &mut Relocation) -> Result<String> {
+        self.relocate_block(relocation).await
+    }
     async fn database(&self, id: &str) -> Result<DatabaseMeta> {
         self.database_metadata(id).await
     }

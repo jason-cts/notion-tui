@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 mod database;
+mod relocation;
+pub use relocation::PendingRelocation;
 
 use crate::{
     editor::{Buffer, Editor, Target},
@@ -60,6 +62,10 @@ pub enum Message {
     },
     Saved(Result<Option<PageItem>, String>),
     Deleted(Result<(), String>),
+    Relocated {
+        pending: Box<PendingRelocation>,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,6 +73,7 @@ pub enum Confirm {
     Discard,
     Quit,
     Delete,
+    Relocate,
 }
 
 pub struct PendingDelete {
@@ -78,6 +85,11 @@ pub struct PendingDelete {
 pub struct LinkPicker {
     pub links: Vec<(String, String)>,
     pub selected: usize,
+}
+
+struct BlockSelection {
+    id: String,
+    index: usize,
 }
 
 pub struct App {
@@ -95,6 +107,8 @@ pub struct App {
     pub editor: Option<Editor>,
     pub confirm: Option<Confirm>,
     pub pending_delete: Option<PendingDelete>,
+    pub pending_relocation: Option<PendingRelocation>,
+    relocation_recovery: HashMap<String, PendingRelocation>,
     pub help: bool,
     pub help_scroll: u16,
     pub viewer: Option<(BlockLabel, u16)>,
@@ -109,6 +123,8 @@ pub struct App {
     pub demo: bool,
     search_generation: u64,
     content_generation: u64,
+    parent_selections: HashMap<String, BlockSelection>,
+    selection_after_back: Option<String>,
     selection_after_insert: Option<(String, InsertPosition)>,
     selection_after_update: Option<(String, String)>,
     selection_after_delete: Option<(String, usize)>,
@@ -136,6 +152,8 @@ impl App {
             editor: None,
             confirm: None,
             pending_delete: None,
+            pending_relocation: None,
+            relocation_recovery: HashMap::new(),
             help: false,
             help_scroll: 0,
             viewer: None,
@@ -149,6 +167,8 @@ impl App {
             quit: false,
             search_generation: 0,
             content_generation: 0,
+            parent_selections: HashMap::new(),
+            selection_after_back: None,
             selection_after_insert: None,
             selection_after_update: None,
             selection_after_delete: None,
@@ -188,6 +208,9 @@ impl App {
             return;
         };
         self.content_generation += 1;
+        if self.selection_after_back.as_deref() != Some(location.id.as_str()) {
+            self.selection_after_back = None;
+        }
         if location.kind == LocationKind::Database {
             self.blocks.clear();
             self.load_database(false);
@@ -214,6 +237,7 @@ impl App {
     }
 
     fn open_page(&mut self, page: PageItem) {
+        self.selection_after_back = None;
         self.path = vec![Location {
             page_id: page.id.clone(),
             id: page.id,
@@ -259,6 +283,7 @@ impl App {
 
     pub fn receive(&mut self, message: Message) {
         match message {
+            Message::Relocated { pending, result } => self.receive_relocation(*pending, result),
             Message::DatabaseMeta {
                 id,
                 generation,
@@ -302,6 +327,16 @@ impl App {
                 self.loading_content = false;
                 match result {
                     Ok((location, blocks)) => {
+                        if self.selection_after_back.take().as_deref() == Some(location.id.as_str())
+                            && let Some(selection) = self.parent_selections.get(&location.id)
+                        {
+                            self.block_selected = blocks
+                                .iter()
+                                .position(|block| block.id == selection.id)
+                                .unwrap_or_else(|| {
+                                    selection.index.min(blocks.len().saturating_sub(1))
+                                });
+                        }
                         if let Some((parent, id)) = self.selection_after_update.take()
                             && parent == location.id
                             && let Some(index) = blocks.iter().position(|block| block.id == id)
@@ -451,12 +486,16 @@ impl App {
                         Confirm::Discard => self.editor = None,
                         Confirm::Quit => self.quit = true,
                         Confirm::Delete => self.delete_block(),
+                        Confirm::Relocate => self.relocate_block(),
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.confirm = None;
                     if confirm == Confirm::Delete {
                         self.pending_delete = None;
+                    }
+                    if confirm == Confirm::Relocate {
+                        self.pending_relocation = None;
                     }
                 }
                 _ => {}
@@ -583,6 +622,10 @@ impl App {
             KeyCode::Backspace => {
                 if self.focus == Focus::Content && self.path.len() > 1 {
                     self.path.pop();
+                    self.selection_after_back = self
+                        .location()
+                        .filter(|location| location.kind != LocationKind::Database)
+                        .map(|location| location.id.clone());
                     self.load();
                 } else {
                     self.focus = Focus::Pages;
@@ -602,6 +645,9 @@ impl App {
                     });
                     self.confirm = Some(Confirm::Delete);
                 }
+            }
+            KeyCode::Char('>' | '<') if self.focus == Focus::Content => {
+                self.prepare_relocation(key.code == KeyCode::Char('>'));
             }
             KeyCode::Char('e') if self.focus == Focus::Content => {
                 if let Some(block) = self.blocks.get(self.block_selected).cloned() {
@@ -710,6 +756,21 @@ impl App {
         } else if !self.loading_content
             && let Some(block) = self.blocks.get(self.block_selected).cloned()
         {
+            if block.block_type != "child_database"
+                && !block.child_page
+                && (!block.children || block.id.is_empty())
+            {
+                return;
+            }
+            if let Some(location) = self.location() {
+                self.parent_selections.insert(
+                    location.id.clone(),
+                    BlockSelection {
+                        id: block.id.clone(),
+                        index: self.block_selected,
+                    },
+                );
+            }
             if block.block_type == "child_database" {
                 self.path.push(Location {
                     id: block.id,

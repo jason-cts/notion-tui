@@ -598,6 +598,94 @@ async fn rejected_writes_keep_app_drafts_and_are_only_retried_explicitly() {
 }
 
 #[tokio::test]
+async fn oauth_relocation_keeps_the_known_copy_across_credential_renewal() {
+    use crate::{
+        model::InsertPosition,
+        service::{Relocation, RelocationState},
+    };
+    let server = MockServer::start().await;
+    let (_directory, store) = saved_store().await;
+    let original = json!({
+        "object":"block", "id":"source", "type":"to_do",
+        "last_edited_time":"2026-01-01T00:00:00Z", "has_children":false, "in_trash":false,
+        "parent":{"type":"block_id", "block_id":"parent"},
+        "to_do":{"rich_text":[], "color":"default", "checked":true}
+    });
+    let mut copy = original.clone();
+    copy["id"] = json!("copy");
+    copy["parent"] = json!({"type":"page_id", "page_id":"page"});
+    let parent = json!({"id":"parent", "type":"paragraph", "has_children":true,
+        "parent":{"type":"page_id", "page_id":"page"}, "paragraph":{"rich_text":[]}});
+    for (id, value) in [
+        ("source", original.clone()),
+        ("parent", parent),
+        ("copy", copy.clone()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/blocks/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(value))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("PATCH"))
+        .and(path("/blocks/page/children"))
+        .and(header("Authorization", "Bearer old"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[copy]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/blocks/source"))
+        .and(header("Authorization", "Bearer old"))
+        .respond_with(unauthorized())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/blocks/source"))
+        .and(header("Authorization", "Bearer new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"in_trash":true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    refresh_mock(&server).await;
+    let api = OAuthService::new(session(client(&server), store))
+        .await
+        .unwrap();
+    let mut request = Relocation {
+        original: crate::model::BlockItem::from_value(&original),
+        source_parent: "parent".into(),
+        destination: "page".into(),
+        position: InsertPosition::After("parent".into()),
+        state: RelocationState::Ready,
+    };
+    let error = api.relocate(&mut request).await.unwrap_err();
+    assert!(error.to_string().contains("not retried"));
+    assert!(matches!(request.state, RelocationState::Copied { .. }));
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.to_string() == "DELETE")
+            .count(),
+        1
+    );
+    assert_eq!(api.relocate(&mut request).await.unwrap(), "copy");
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.to_string() == "PATCH")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn oauth_deletion_refreshes_credentials_without_replaying_the_delete() {
     for rejected_method in ["GET", "DELETE"] {
         let server = MockServer::start().await;

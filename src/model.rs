@@ -198,6 +198,31 @@ pub struct BlockItem {
 }
 
 impl BlockItem {
+    pub fn relocatable(&self) -> bool {
+        !self.id.is_empty()
+            && !self.modified.is_empty()
+            && !self.children
+            && !self.protected
+            && self.input.is_some()
+            && matches!(
+                self.kind,
+                Some(Kind::Paragraph | Kind::Bullet | Kind::Number | Kind::Todo)
+            )
+    }
+
+    pub fn accepts_nested_blocks(&self) -> bool {
+        matches!(
+            self.block_type.as_str(),
+            "paragraph"
+                | "bulleted_list_item"
+                | "numbered_list_item"
+                | "to_do"
+                | "toggle"
+                | "quote"
+                | "callout"
+        )
+    }
+
     pub fn from_value(value: &Value) -> Self {
         let block_type = value["type"].as_str().unwrap_or("unsupported").to_owned();
         let body = &value[&block_type];

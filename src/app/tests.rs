@@ -2,7 +2,7 @@ use super::*;
 use crate::{model::tests::paragraph, service::DemoService};
 use std::sync::Arc;
 
-fn app() -> (App, mpsc::UnboundedReceiver<Message>) {
+pub(super) fn app() -> (App, mpsc::UnboundedReceiver<Message>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(Arc::new(DemoService), tx, true);
     app.path.push(Location {
@@ -67,7 +67,7 @@ fn table_cells_keep_independent_styles_and_selection() {
     assert!(editor.changed());
 }
 
-async fn drain_content(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
+pub(super) async fn drain_content(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while app.loading_content {
             app.receive(rx.recv().await.unwrap());
@@ -1146,6 +1146,135 @@ async fn rich_text_saves_directly_and_protected_runs_stay_read_only() {
     app.key(KeyCode::Char('e').into());
     assert!(app.editor.is_none());
     assert!(app.error);
+}
+
+#[tokio::test]
+async fn back_restores_parent_selection_after_entering_each_child_kind() {
+    for kind in ["child_page", "paragraph", "child_database"] {
+        let (mut app, mut rx) = app();
+        app.blocks = (0..4)
+            .map(|index| {
+                let mut block = paragraph();
+                block.id = format!("parent-block-{index}");
+                block
+            })
+            .collect();
+        app.blocks[2].block_type = kind.into();
+        app.blocks[2].child_page = kind == "child_page";
+        app.blocks[2].children = kind == "paragraph";
+        if kind == "child_database" {
+            app.blocks[2].id = "demo-database".into();
+        }
+        let parent_blocks = app.blocks.clone();
+        app.block_selected = 2;
+        app.key(KeyCode::Enter.into());
+        assert_eq!(app.path.len(), 2);
+        if kind != "child_database" {
+            assert_eq!(app.block_selected, 0);
+        }
+        drain_content(&mut app, &mut rx).await;
+        app.key(KeyCode::Backspace.into());
+        assert_eq!(app.path.len(), 1);
+        app.receive(Message::Content {
+            generation: app.content_generation,
+            result: Ok((app.location().unwrap().clone(), parent_blocks)),
+        });
+        assert_eq!(app.block_selected, 2, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn back_restores_independent_selections_at_multiple_depths() {
+    let (mut app, mut rx, _) = deletion_app(5, false);
+    for index in [3, 1] {
+        app.blocks[index].children = true;
+        app.block_selected = index;
+        app.key(KeyCode::Enter.into());
+        assert_eq!(app.block_selected, 0);
+        drain_content(&mut app, &mut rx).await;
+    }
+    for index in [1, 3] {
+        app.key(KeyCode::Backspace.into());
+        drain_content(&mut app, &mut rx).await;
+        assert_eq!(app.block_selected, index);
+    }
+    app.blocks[3].children = true;
+    app.key(KeyCode::Enter.into());
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(
+        app.block_selected, 0,
+        "re-entered children start at the top"
+    );
+}
+
+#[tokio::test]
+async fn back_follows_block_identity_or_clamps_when_parent_content_changes() {
+    for (remaining, expected) in [
+        (vec![3, 2, 1, 0], 1),
+        (vec![0, 1, 3], 2),
+        (vec![0], 0),
+        (vec![], 0),
+    ] {
+        let (mut app, mut rx, service) = deletion_app(4, false);
+        let original = app.blocks.clone();
+        app.blocks[2].children = true;
+        app.block_selected = 2;
+        app.key(KeyCode::Enter.into());
+        drain_content(&mut app, &mut rx).await;
+        *service.blocks.lock().unwrap() = remaining
+            .iter()
+            .map(|&index| original[index].clone())
+            .collect();
+        app.key(KeyCode::Backspace.into());
+        drain_content(&mut app, &mut rx).await;
+        assert_eq!(app.block_selected, expected, "{remaining:?}");
+    }
+}
+
+#[tokio::test]
+async fn failed_back_reload_retains_selection_for_retry_and_ignores_stale_responses() {
+    let (mut app, mut rx, _) = deletion_app(4, false);
+    app.blocks[2].children = true;
+    app.block_selected = 2;
+    app.key(KeyCode::Enter.into());
+    drain_content(&mut app, &mut rx).await;
+    app.key(KeyCode::Backspace.into());
+    let generation = app.content_generation;
+    app.receive(Message::Content {
+        generation,
+        result: Err("temporary failure".into()),
+    });
+    assert!(app.error);
+    assert!(app.blocks.is_empty());
+    app.key(KeyCode::Char('r').into());
+    app.receive(Message::Content {
+        generation,
+        result: Ok((app.location().unwrap().clone(), vec![])),
+    });
+    assert!(app.loading_content);
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.block_selected, 2);
+    assert!(app.selection_after_back.is_none());
+}
+
+#[tokio::test]
+async fn opening_a_page_cancels_pending_back_selection_even_for_the_same_page() {
+    let (mut app, mut rx, _) = deletion_app(4, false);
+    app.blocks[2].children = true;
+    app.block_selected = 2;
+    app.key(KeyCode::Enter.into());
+    drain_content(&mut app, &mut rx).await;
+    app.key(KeyCode::Backspace.into());
+    app.receive(Message::Content {
+        generation: app.content_generation,
+        result: Err("temporary failure".into()),
+    });
+    app.open_page(PageItem {
+        id: "page".into(),
+        title: "Page".into(),
+    });
+    drain_content(&mut app, &mut rx).await;
+    assert_eq!(app.block_selected, 0);
 }
 
 #[tokio::test]

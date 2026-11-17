@@ -26,7 +26,7 @@ const ERROR: Color = Color::Rgb(255, 154, 145);
 #[derive(Default)]
 pub struct Ui {
     pages: ListState,
-    block_offset: usize,
+    block_offsets: std::collections::HashMap<String, usize>,
     database_offsets: std::collections::HashMap<String, usize>,
     pub links: Links,
 }
@@ -111,7 +111,7 @@ impl Ui {
             area,
         );
         if area.width < 16 || area.height < 7 {
-            if app.confirm == Some(Confirm::Delete) {
+            if matches!(app.confirm, Some(Confirm::Delete | Confirm::Relocate)) {
                 render_confirmation(frame, app);
                 return;
             }
@@ -203,7 +203,7 @@ impl Ui {
             Paragraph::new(
                 if app.database().is_some_and(crate::database::DatabaseState::is_table) { "arrows select cells  e edit  Enter icon opens page  Backspace parent  [ / ] views  < > more columns" }
                 else if app.database().is_some() { "[ / ] views  ←/→ columns  Enter page  Backspace parent  v details  o link  r refresh  q quit" }
-                else { "Tab panes  / search  Enter open  o link  v read  e edit  d delete  a after  A before  ? help  q quit" },
+                else { "Tab panes  / search  Enter open  o link  v read  e edit  d delete  >/< indent/outdent  a after  A before  ? help  q quit" },
             )
             .style(Style::default().fg(ACCENT)),
             Rect {
@@ -429,8 +429,11 @@ impl Ui {
             });
         let block = panel(title, app.focus == Focus::Content);
         let inner = block.inner(area);
+        let location = app.location().map_or("", |location| location.id.as_str());
         if app.blocks.is_empty() {
-            self.block_offset = 0;
+            if !app.loading_content && !app.error {
+                self.block_offsets.remove(location);
+            }
             frame.render_widget(Paragraph::new(if app.loading_content { "\n  Loading content…" } else if app.path.is_empty() {
                 "\n  Open a page to get started.\n\n  / search your workspace\n  Enter opens a page\n  ? shows all keyboard shortcuts"
             } else { "\n  No blocks here.\n\n  a/A insert a block · n create a child page" }).block(block).wrap(Wrap { trim: false }), area);
@@ -447,18 +450,19 @@ impl Ui {
             })
             .collect();
         let selected = app.block_selected.min(rows.len() - 1);
-        self.block_offset = self.block_offset.min(selected);
-        while self.block_offset < selected
-            && rows[self.block_offset..=selected]
+        let block_offset = self.block_offsets.entry(location.to_owned()).or_default();
+        *block_offset = (*block_offset).min(selected);
+        while *block_offset < selected
+            && rows[*block_offset..=selected]
                 .iter()
                 .map(Vec::len)
                 .sum::<usize>()
                 > usize::from(inner.height)
         {
-            self.block_offset += 1;
+            *block_offset += 1;
         }
         let mut y = inner.y;
-        for (index, lines) in rows.iter().enumerate().skip(self.block_offset) {
+        for (index, lines) in rows.iter().enumerate().skip(*block_offset) {
             let color = if app.blocks[index].block_type.starts_with("heading_") {
                 ACCENT
             } else {
@@ -517,6 +521,7 @@ impl Ui {
             "  EDIT\n",
             "  e             Edit selected text block, table row, or database cell\n",
             "  d             Delete selected block (confirm with y)\n",
+            "  > / <         Indent / outdent selected leaf block (confirm with y)\n",
             "  Space         Toggle selected to-do\n",
             "  a / Shift+A   Insert a block after / before the selected block\n",
             "  n             Create a child of the current page\n",
@@ -533,6 +538,7 @@ impl Ui {
             "  Ctrl-I needs enhanced keys; otherwise use Shift+F10.\n",
             "  Mentions, equations, and unsupported types cannot be edited.\n",
             "  Deleting a container includes its contents; restore in Notion Trash.\n",
+            "  Indent/outdent recreates the block, then trashes the original.\n",
             "  A failed save keeps your draft. Check Notion before retrying.\n\n",
             "  ↑/↓        scroll · PageUp/PageDown move ten lines\n",
             "  Any other key closes help."
@@ -554,6 +560,10 @@ fn render_confirmation(frame: &mut Frame, app: &App) {
                 render_delete_confirmation(frame, app);
                 return;
             }
+            Confirm::Relocate => {
+                render_relocation_confirmation(frame, app);
+                return;
+            }
             Confirm::Discard => "Discard this draft?\n\ny discard · n keep editing",
             Confirm::Quit => "Quit and discard this draft?\n\ny quit · n keep editing",
         };
@@ -566,6 +576,74 @@ fn render_confirmation(frame: &mut Frame, app: &App) {
             area,
         );
     }
+}
+
+fn render_relocation_confirmation(frame: &mut Frame, app: &App) {
+    let Some(pending) = &app.pending_relocation else {
+        return;
+    };
+    let retry = matches!(
+        pending.request.state,
+        crate::service::RelocationState::Copied { .. }
+    );
+    let action = if pending.indent {
+        "INDENT BLOCK"
+    } else {
+        "OUTDENT BLOCK"
+    };
+    let area = popup(frame.area(), 76, 16);
+    frame.render_widget(Clear, area);
+    let border = panel(action.into(), true);
+    let inner = border.inner(area);
+    frame.render_widget(border, area);
+    let controls = wrapped(
+        if inner.width < 26 {
+            "y apply\nn/Esc cancel"
+        } else {
+            "y apply · n/Esc cancel"
+        },
+        inner.width,
+    );
+    let body_height = inner.height.saturating_sub(controls.len() as u16);
+    let destination = pending.path.last().map_or("", |l| l.title.as_str());
+    let text = if retry {
+        format!(
+            "Resume the pending move to {}?\nThe replacement already exists. Verify it and finish trashing the original; no new copy will be created.",
+            clean(destination)
+        )
+    } else {
+        format!(
+            "{}?\nCreate a replacement, then move the original to Trash.\nNew block ID; history and comments stay with the original. Links to the original still point there.\nDestination: {}",
+            if pending.indent {
+                "Nest under the previous sibling"
+            } else {
+                "Place after the parent"
+            },
+            clean(destination)
+        )
+    };
+    let preview: String = clean(&pending.request.original.text)
+        .chars()
+        .take(80)
+        .collect();
+    let mut lines = wrapped(&text, inner.width);
+    lines.extend(wrapped(&format!("Block: {preview}"), inner.width));
+    lines.truncate(usize::from(body_height));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            height: body_height,
+            ..inner
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(controls).style(Style::default().fg(ERROR)),
+        Rect {
+            y: inner.y + body_height,
+            height: inner.height - body_height,
+            ..inner
+        },
+    );
 }
 
 fn render_delete_confirmation(frame: &mut Frame, app: &App) {
@@ -1025,6 +1103,58 @@ mod tests {
     }
 
     #[test]
+    fn relocation_prompt_explains_recreation_and_keeps_cancel_controls_visible() {
+        for (width, height) in [(120, 35), (45, 20), (22, 12), (16, 7), (10, 4), (1, 1)] {
+            for indent in [true, false] {
+                let (tx, _) = mpsc::unbounded_channel();
+                let mut app = App::new(Arc::new(DemoService), tx, true);
+                let location = crate::app::Location {
+                    id: "parent".into(),
+                    title: "Destination".into(),
+                    kind: crate::app::LocationKind::Blocks,
+                    page_id: "page".into(),
+                    list_depth: 1,
+                };
+                app.pending_relocation = Some(crate::app::PendingRelocation {
+                    request: crate::service::Relocation {
+                        original: crate::model::tests::paragraph(),
+                        source_parent: "page".into(),
+                        destination: "parent".into(),
+                        position: InsertPosition::End,
+                        state: crate::service::RelocationState::Ready,
+                    },
+                    path: vec![location],
+                    indent,
+                });
+                app.confirm = Some(Confirm::Relocate);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| Ui::default().draw(f, &app)).unwrap();
+                let contents: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                if width >= 22 {
+                    assert!(contents.contains(if indent {
+                        "INDENT BLOCK"
+                    } else {
+                        "OUTDENT BLOCK"
+                    }));
+                    assert!(contents.contains("y apply"));
+                    assert!(contents.contains("n/Esc cancel"));
+                }
+                if width >= 45 {
+                    assert!(contents.contains("New block ID"));
+                    assert!(contents.contains("Destination"));
+                    assert!(contents.contains("Hello"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deletion_prompt_shows_target_warning_and_cancel_controls_at_narrow_widths() {
         for (width, height) in [(120, 35), (45, 20), (22, 12), (16, 7), (10, 4), (1, 1)] {
             for block_type in ["paragraph", "child_page", "child_database", "toggle"] {
@@ -1091,6 +1221,116 @@ mod tests {
                 .all(|line| UnicodeWidthStr::width(line.as_str()) <= 13)
         );
         assert!(!wrapped_block(&label, 3).is_empty());
+    }
+
+    #[test]
+    fn parent_scroll_survives_child_navigation_loading_and_resize() {
+        use crate::app::{Location, LocationKind};
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Arc::new(DemoService), tx, true);
+        app.focus = Focus::Content;
+        app.path.push(Location {
+            id: "parent".into(),
+            title: "Parent".into(),
+            kind: LocationKind::Page,
+            page_id: "parent".into(),
+            list_depth: 0,
+        });
+        app.blocks = (0..20)
+            .map(|index| {
+                crate::model::BlockItem::from_value(&serde_json::json!({
+                    "id": format!("block-{index}"), "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "plain_text": format!("parent item{index}")}]}
+                }))
+            })
+            .collect();
+        let parent_blocks = app.blocks.clone();
+        let mut ui = Ui::default();
+        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        app.block_selected = 14;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        // Move up within the viewport so scrolling from the top would produce a different view.
+        app.block_selected = 12;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        let saved_offset = ui.block_offsets["parent"];
+        let saved_buffer = terminal.backend().buffer().clone();
+        assert!(saved_offset > 0);
+
+        app.path.push(Location {
+            id: "child".into(),
+            title: "Child".into(),
+            kind: LocationKind::Blocks,
+            page_id: "parent".into(),
+            list_depth: 0,
+        });
+        app.blocks.clear();
+        app.block_selected = 0;
+        app.loading_content = true;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert_eq!(ui.block_offsets["parent"], saved_offset);
+        app.blocks = parent_blocks.clone();
+        app.loading_content = false;
+        app.block_selected = 14;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert!(ui.block_offsets["child"] > 0);
+
+        app.path.pop();
+        app.blocks.clear();
+        app.block_selected = 0;
+        app.loading_content = true;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert_eq!(ui.block_offsets["parent"], saved_offset);
+        app.loading_content = false;
+        app.error = true;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert_eq!(ui.block_offsets["parent"], saved_offset);
+
+        app.blocks = parent_blocks;
+        app.block_selected = 12;
+        app.error = false;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert_eq!(ui.block_offsets["parent"], saved_offset);
+        assert_eq!(*terminal.backend().buffer(), saved_buffer);
+
+        let mut smaller = Terminal::new(TestBackend::new(25, 6)).unwrap();
+        smaller
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert!(ui.block_offsets["parent"] > saved_offset);
+        let contents: String = smaller
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(contents.contains("parent item12"), "{contents}");
+
+        app.path.last_mut().unwrap().id = "child".into();
+        app.block_selected = 0;
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert_eq!(ui.block_offsets["child"], 0, "new entries start at the top");
+        app.blocks.clear();
+        terminal
+            .draw(|frame| ui.content(frame, &app, frame.area()))
+            .unwrap();
+        assert!(!ui.block_offsets.contains_key("child"));
     }
 
     #[test]
