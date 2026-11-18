@@ -20,6 +20,7 @@ use crate::model::{
 use rusticnotion::models::view::View;
 
 mod comments;
+pub use comments::CommentReadError;
 pub(crate) mod database;
 mod relocation;
 pub use relocation::{Relocation, RelocationState};

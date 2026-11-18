@@ -335,7 +335,7 @@ impl BlockItem {
             "toggle" => "▸ ".into(),
             _ => String::new(),
         };
-        let text = if self.text.is_empty() {
+        let text = if self.text.is_empty() && self.block_type != "paragraph" {
             format!("[{}]", self.block_type)
         } else {
             self.text.clone()

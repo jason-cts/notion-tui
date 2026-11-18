@@ -8,12 +8,54 @@ use rusticnotion::{
     },
 };
 
-fn comment_error(error: rusticnotion::Error) -> anyhow::Error {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommentReadError {
+    Denied,
+    RateLimited(Duration),
+    Other(String),
+}
+
+impl From<anyhow::Error> for CommentReadError {
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<rusticnotion::Error>() {
+            Some(rusticnotion::Error::ApiError { error }) if error.status.code() == 403 => {
+                Self::Denied
+            }
+            Some(rusticnotion::Error::RateLimited { retry_after_secs }) => {
+                Self::RateLimited(Duration::from_secs((*retry_after_secs).max(1)))
+            }
+            _ => Self::Other(format!("{error:#}")),
+        }
+    }
+}
+
+impl std::fmt::Display for CommentReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied => write!(
+                f,
+                "Comments unavailable: enable Read comments. Press c on a block to retry."
+            ),
+            Self::RateLimited(delay) => write!(
+                f,
+                "Comments rate limited; retry in {} seconds",
+                delay.as_secs().max(1)
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+fn comment_error(error: rusticnotion::Error, writing: bool) -> anyhow::Error {
     let denied =
         matches!(&error, rusticnotion::Error::ApiError { error } if error.status.code() == 403);
     let error: anyhow::Error = error.into();
     if denied {
-        error.context("Comment access denied. Enable Read comments and Insert comments for your integration; this comment may not permit changes by this integration")
+        error.context(if writing {
+            "Comment change denied. Check Insert comments and whether this integration may change the comment"
+        } else {
+            "Comment access denied. Enable Read comments for your integration"
+        })
     } else {
         error
     }
@@ -31,7 +73,7 @@ impl ApiService {
                 },
             )
             .await
-            .map_err(comment_error)
+            .map_err(|error| comment_error(error, false))
             .context("Could not load comments")?;
         Ok(!response.results.is_empty())
     }
@@ -52,7 +94,7 @@ impl ApiService {
                     },
                 )
                 .await
-                .map_err(comment_error)
+                .map_err(|error| comment_error(error, false))
                 .context("Could not load comments")?;
             for comment in response.results {
                 comments.push(Comment::from_value(&serde_json::to_value(comment)?)?);
@@ -69,7 +111,7 @@ impl ApiService {
             .api
             .get_comment(original.id.parse::<CommentId>()?)
             .await
-            .map_err(comment_error)
+            .map_err(|error| comment_error(error, false))
             .context("Could not check comment for remote changes")?;
         check_snapshot(
             original,
@@ -115,7 +157,7 @@ impl ApiService {
                     .await
             }
         }
-        .map_err(comment_error)
+        .map_err(|error| comment_error(error, true))
         .context(
             "Comment write failed; inspect Notion before retrying if the response was unavailable",
         )?;

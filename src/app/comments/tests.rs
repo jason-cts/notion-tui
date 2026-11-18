@@ -2,7 +2,7 @@ use super::*;
 use crate::service::{NotionService, Write};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
 };
 
 fn comment(id: &str) -> Comment {
@@ -14,17 +14,50 @@ fn comment(id: &str) -> Comment {
 
 #[derive(Default)]
 struct CommentsService {
+    pages: Mutex<Vec<PageItem>>,
     items: Mutex<Vec<Comment>>,
     writes: Mutex<Vec<CommentWrite>>,
     probes: Mutex<Vec<String>>,
     fail_reads: AtomicBool,
     fail_writes: AtomicBool,
+    read_status: AtomicU16,
+    comment_reads: AtomicUsize,
+}
+
+impl CommentsService {
+    fn check_read(&self) -> anyhow::Result<()> {
+        let status = self.read_status.load(Ordering::SeqCst);
+        if status == 429 {
+            return Err(rusticnotion::Error::RateLimited {
+                retry_after_secs: 7,
+            }
+            .into());
+        }
+        if status != 0 {
+            let code = match status {
+                403 => "restricted_resource",
+                404 => "object_not_found",
+                _ => "internal_server_error",
+            };
+            return Err(rusticnotion::Error::ApiError {
+                error: serde_json::from_value(serde_json::json!({
+                    "object":"error", "status":status, "code":code, "message":"Unavailable"
+                }))
+                .unwrap(),
+            }
+            .into());
+        }
+        if self.fail_reads.load(Ordering::SeqCst) {
+            anyhow::bail!("No read access");
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 impl NotionService for CommentsService {
     async fn search(&self, _: &str) -> anyhow::Result<Vec<PageItem>> {
-        Ok(vec![])
+        Ok(self.pages.lock().unwrap().clone())
     }
     async fn page(&self, id: &str) -> anyhow::Result<PageItem> {
         Ok(PageItem {
@@ -40,15 +73,12 @@ impl NotionService for CommentsService {
     }
     async fn has_comments(&self, id: &str) -> anyhow::Result<bool> {
         self.probes.lock().unwrap().push(id.into());
-        if self.fail_reads.load(Ordering::SeqCst) {
-            anyhow::bail!("No read access");
-        }
+        self.check_read()?;
         Ok(!self.items.lock().unwrap().is_empty())
     }
     async fn comments(&self, _: &str) -> anyhow::Result<Vec<Comment>> {
-        if self.fail_reads.load(Ordering::SeqCst) {
-            anyhow::bail!("No read access");
-        }
+        self.comment_reads.fetch_add(1, Ordering::SeqCst);
+        self.check_read()?;
         Ok(self.items.lock().unwrap().clone())
     }
     async fn comment_write(&self, write: CommentWrite) -> anyhow::Result<String> {
@@ -98,6 +128,265 @@ async fn open(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Message>) {
     app.key(KeyCode::Char('c').into());
     assert!(app.comments.as_ref().unwrap().loading);
     receive(app, rx).await;
+}
+
+fn authenticated_app(service: Arc<CommentsService>) -> (App, mpsc::UnboundedReceiver<Message>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (App::new(service, tx, false), rx)
+}
+
+fn shared_page() -> PageItem {
+    PageItem {
+        id: "shared-page".into(),
+        title: "Shared page".into(),
+    }
+}
+
+#[tokio::test]
+async fn startup_probes_first_shared_page_once_and_gates_indicators() {
+    for populated in [false, true] {
+        let service = Arc::new(CommentsService::default());
+        *service.pages.lock().unwrap() = vec![
+            shared_page(),
+            PageItem {
+                id: "second-page".into(),
+                title: "Second".into(),
+            },
+        ];
+        if populated {
+            service.items.lock().unwrap().push(comment("first"));
+        }
+        let (mut app, mut rx) = authenticated_app(service.clone());
+        app.start_search();
+        receive(&mut app, &mut rx).await;
+        assert!(matches!(
+            app.comment_indicators.access,
+            CommentAccess::Checking(_)
+        ));
+        app.blocks.push(crate::model::tests::paragraph());
+        for _ in 0..3 {
+            app.check_visible_comments(&["block".into()]);
+            assert!(app.comment_indicators.active.is_empty());
+        }
+        receive(&mut app, &mut rx).await;
+        assert_eq!(app.comment_indicators.access, CommentAccess::Available);
+        assert_eq!(*service.probes.lock().unwrap(), ["shared-page"]);
+        app.start_search();
+        receive(&mut app, &mut rx).await;
+        assert_eq!(*service.probes.lock().unwrap(), ["shared-page"]);
+        app.check_visible_comments(&["block".into()]);
+        receive(&mut app, &mut rx).await;
+        assert_eq!(*service.probes.lock().unwrap(), ["shared-page", "block"]);
+        assert_eq!(app.block_has_comments("block"), populated);
+    }
+}
+
+#[tokio::test]
+async fn startup_defers_without_pages_and_demo_skips_the_probe() {
+    let service = Arc::new(CommentsService::default());
+    let (mut app, mut rx) = authenticated_app(service.clone());
+    app.start_search();
+    receive(&mut app, &mut rx).await;
+    app.check_visible_comments(&[]);
+    assert_eq!(app.comment_indicators.access, CommentAccess::Unchecked);
+    assert!(service.probes.lock().unwrap().is_empty());
+    service.pages.lock().unwrap().push(shared_page());
+    app.start_search();
+    receive(&mut app, &mut rx).await;
+    receive(&mut app, &mut rx).await;
+    assert_eq!(app.comment_indicators.access, CommentAccess::Available);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut demo = App::new(service.clone(), tx, true);
+    demo.start_search();
+    receive(&mut demo, &mut rx).await;
+    assert_eq!(demo.comment_indicators.access, CommentAccess::Available);
+    assert_eq!(*service.probes.lock().unwrap(), ["shared-page"]);
+}
+
+#[tokio::test]
+async fn denied_startup_keeps_browsing_and_refresh_quiet_until_c_succeeds() {
+    let service = Arc::new(CommentsService::default());
+    service.pages.lock().unwrap().push(shared_page());
+    service.read_status.store(403, Ordering::SeqCst);
+    let (mut app, mut rx) = authenticated_app(service.clone());
+    app.start_search();
+    receive(&mut app, &mut rx).await;
+    receive(&mut app, &mut rx).await;
+    assert_eq!(app.comment_indicators.access, CommentAccess::Denied);
+    assert_eq!(app.status, CommentReadError::Denied.to_string());
+    assert!(!app.status.contains("Insert comments"));
+    assert!(!app.quit);
+    app.key(KeyCode::Char('r').into());
+    receive(&mut app, &mut rx).await;
+    app.open_page(shared_page());
+    receive(&mut app, &mut rx).await;
+    app.key(KeyCode::Char('r').into());
+    receive(&mut app, &mut rx).await;
+    for _ in 0..3 {
+        app.check_visible_comments(&["block".into()]);
+    }
+    assert_eq!(app.comment_indicators.access, CommentAccess::Denied);
+    assert_eq!(*service.probes.lock().unwrap(), ["shared-page"]);
+    assert!(!app.status.contains("Comments unavailable"));
+    open(&mut app, &mut rx).await;
+    assert_eq!(
+        app.comments.as_ref().unwrap().error.as_deref(),
+        Some(CommentReadError::Denied.to_string().as_str())
+    );
+    app.key(KeyCode::Esc.into());
+    service.read_status.store(0, Ordering::SeqCst);
+    open(&mut app, &mut rx).await;
+    assert_eq!(app.comment_indicators.access, CommentAccess::Available);
+    assert!(app.comments.as_ref().unwrap().error.is_none());
+    app.key(KeyCode::Esc.into());
+    app.check_visible_comments(&["block".into()]);
+    // The modal already cached this block; another visible block is checked normally.
+    let mut second = app.blocks[0].clone();
+    second.id = "another-block".into();
+    app.blocks.push(second);
+    app.check_visible_comments(&["another-block".into()]);
+    receive(&mut app, &mut rx).await;
+    assert_eq!(
+        *service.probes.lock().unwrap(),
+        ["shared-page", "another-block"]
+    );
+}
+
+#[tokio::test]
+async fn temporary_startup_failures_pause_scanning_and_refresh_can_recover() {
+    for status in [0, 404, 500] {
+        let service = Arc::new(CommentsService::default());
+        service.pages.lock().unwrap().push(shared_page());
+        service.read_status.store(status, Ordering::SeqCst);
+        service.fail_reads.store(status == 0, Ordering::SeqCst);
+        let (mut app, mut rx) = authenticated_app(service.clone());
+        app.start_search();
+        receive(&mut app, &mut rx).await;
+        receive(&mut app, &mut rx).await;
+        assert_eq!(
+            app.comment_indicators.access,
+            CommentAccess::TemporarilyUnavailable
+        );
+        assert!(!app.status.contains("enable Read comments"));
+        app.check_visible_comments(&["block".into()]);
+        assert_eq!(service.probes.lock().unwrap().len(), 1);
+        service.read_status.store(0, Ordering::SeqCst);
+        service.fail_reads.store(false, Ordering::SeqCst);
+        app.key(KeyCode::Char('r').into());
+        receive(&mut app, &mut rx).await;
+        receive(&mut app, &mut rx).await;
+        assert_eq!(app.comment_indicators.access, CommentAccess::Available);
+        assert_eq!(
+            *service.probes.lock().unwrap(),
+            ["shared-page", "shared-page"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn rate_limited_startup_blocks_explicit_retries_until_the_deadline() {
+    let service = Arc::new(CommentsService::default());
+    service.pages.lock().unwrap().push(shared_page());
+    service.read_status.store(429, Ordering::SeqCst);
+    let (mut app, mut rx) = authenticated_app(service.clone());
+    app.start_search();
+    receive(&mut app, &mut rx).await;
+    receive(&mut app, &mut rx).await;
+    assert_eq!(
+        app.comment_indicators.access,
+        CommentAccess::TemporarilyUnavailable
+    );
+    app.key(KeyCode::Char('r').into());
+    receive(&mut app, &mut rx).await;
+    app.open_page(shared_page());
+    receive(&mut app, &mut rx).await;
+    app.key(KeyCode::Char('c').into());
+    assert!(!app.comments.as_ref().unwrap().loading);
+    assert!(
+        app.comments
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("rate limited")
+    );
+    assert_eq!(service.comment_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(service.probes.lock().unwrap().len(), 1);
+    app.key(KeyCode::Esc.into());
+    service.read_status.store(0, Ordering::SeqCst);
+    app.comment_indicators.retry_at = Some(Instant::now() - Duration::from_secs(1));
+    app.check_visible_comments(&["block".into()]);
+    receive(&mut app, &mut rx).await;
+    assert_eq!(app.comment_indicators.access, CommentAccess::Available);
+    assert_eq!(service.probes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn explicit_read_supersedes_pending_startup_and_indicator_results() {
+    let service = Arc::new(CommentsService::default());
+    service.pages.lock().unwrap().push(shared_page());
+    let (mut app, mut rx) = authenticated_app(service.clone());
+    app.start_search();
+    receive(&mut app, &mut rx).await;
+    let request = match app.comment_indicators.access {
+        CommentAccess::Checking(request) => request,
+        _ => panic!("expected startup probe"),
+    };
+    let _late_startup = rx.recv().await.unwrap();
+    app.open_page(shared_page());
+    receive(&mut app, &mut rx).await;
+    open(&mut app, &mut rx).await;
+    app.receive(Message::CommentAccess {
+        request,
+        result: Err(CommentReadError::Denied),
+    });
+    assert_eq!(app.comment_indicators.access, CommentAccess::Available);
+    assert!(!app.error);
+    app.key(KeyCode::Esc.into());
+    app.comment_indicators.cache.remove("block");
+    app.check_visible_comments(&["block".into()]);
+    let late_presence = rx.recv().await.unwrap();
+    open(&mut app, &mut rx).await;
+    let Message::CommentPresence {
+        id,
+        request,
+        generation,
+        ..
+    } = late_presence
+    else {
+        panic!("expected indicator request")
+    };
+    app.receive(Message::CommentPresence {
+        id,
+        request,
+        generation,
+        result: Err(CommentReadError::RateLimited(Duration::from_secs(60))),
+    });
+    assert_eq!(app.comment_indicators.access, CommentAccess::Available);
+    assert!(app.comment_indicators.retry_at.is_none());
+    assert!(!app.error);
+}
+
+#[tokio::test]
+async fn denied_indicator_cancels_other_pending_checks_and_warns_once() {
+    let service = Arc::new(CommentsService::default());
+    service.read_status.store(403, Ordering::SeqCst);
+    let (mut app, mut rx) = app(service.clone());
+    let mut second = app.blocks[0].clone();
+    second.id = "second".into();
+    app.blocks.push(second);
+    app.check_visible_comments(&["block".into()]);
+    app.comment_indicators.next_start = None;
+    app.check_visible_comments(&["second".into()]);
+    receive(&mut app, &mut rx).await;
+    assert_eq!(app.comment_indicators.access, CommentAccess::Denied);
+    app.status = "Browsing".into();
+    receive(&mut app, &mut rx).await;
+    assert_eq!(app.status, "Browsing");
+    assert!(app.comment_indicators.active.is_empty());
+    app.check_visible_comments(&["block".into(), "second".into()]);
+    assert_eq!(service.probes.lock().unwrap().len(), 2);
 }
 
 fn ctrl_s() -> KeyEvent {
@@ -248,6 +537,7 @@ async fn closed_modal_responses_are_ignored_and_save_success_survives_refresh_fa
     let (mut app, mut rx) = app(service.clone());
     app.key(KeyCode::Char('c').into());
     let old_generation = app.comments.as_ref().unwrap().generation;
+    let old_access_request = app.comment_indicators.serial;
     app.key(KeyCode::Esc.into());
     receive(&mut app, &mut rx).await;
     assert!(app.comments.is_none());
@@ -255,6 +545,7 @@ async fn closed_modal_responses_are_ignored_and_save_success_survives_refresh_fa
     app.receive(Message::CommentsLoaded {
         id: app.blocks[0].id.clone(),
         generation: old_generation,
+        access_request: old_access_request,
         result: Ok(vec![comment("stale")]),
     });
     assert!(app.comments.as_ref().unwrap().items.is_empty());
@@ -322,6 +613,7 @@ async fn failed_indicators_wait_for_refresh_and_stale_checks_cannot_overwrite_mo
     app.check_visible_comments(std::slice::from_ref(&id));
     assert!(app.comment_indicators.active.is_empty());
     app.invalidate_comment_indicators();
+    app.retry_temporary_comment_access();
     service.fail_reads.store(false, Ordering::SeqCst);
     app.check_visible_comments(std::slice::from_ref(&id));
     let request = app.comment_indicators.serial;
@@ -334,13 +626,7 @@ async fn failed_indicators_wait_for_refresh_and_stale_checks_cannot_overwrite_mo
     app.comment_indicators
         .cache
         .insert(id.clone(), Presence::Pending(request));
-    app.receive_comment_presence(
-        id.clone(),
-        request,
-        app.content_generation + 1,
-        Ok(false),
-        None,
-    );
+    app.receive_comment_presence(id.clone(), request, app.content_generation + 1, Ok(false));
     assert!(!app.comment_indicators.cache.contains_key(&id));
 }
 
@@ -356,10 +642,9 @@ async fn retry_after_blocks_new_indicator_requests_without_rechecking_failed_blo
         id,
         1,
         app.content_generation,
-        Err("rate limited".into()),
-        Some(Duration::from_secs(7)),
+        Err(CommentReadError::RateLimited(Duration::from_secs(7))),
     );
-    assert!(app.comment_indicators.next_start.unwrap() >= before + Duration::from_secs(7));
+    assert!(app.comment_indicators.retry_at.unwrap() >= before + Duration::from_secs(7));
     app.check_visible_comments(&["other".into()]);
     assert!(app.comment_indicators.active.is_empty());
 }

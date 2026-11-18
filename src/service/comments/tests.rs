@@ -194,11 +194,12 @@ async fn malformed_pages_and_repeated_cursors_fail_instead_of_appearing_empty() 
 
 #[tokio::test]
 async fn permissions_rate_limits_and_unreadable_write_responses_are_actionable() {
-    for status in [401, 403, 429, 500] {
+    for status in [401, 403, 404, 429, 500] {
         let server = MockServer::start().await;
         let code = match status {
             401 => "unauthorized",
             403 => "restricted_resource",
+            404 => "object_not_found",
             429 => "rate_limited",
             _ => "internal_server_error",
         };
@@ -216,7 +217,10 @@ async fn permissions_rate_limits_and_unreadable_write_responses_are_actionable()
         let error = api.has_comments("block").await.unwrap_err();
         match status {
             401 => assert!(is_unauthorized(&error)),
-            403 => assert!(format!("{error:#}").contains("Read comments")),
+            403 => {
+                assert!(format!("{error:#}").contains("Read comments"));
+                assert!(!format!("{error:#}").contains("Insert comments"));
+            }
             429 => assert!(matches!(
                 error.downcast_ref::<rusticnotion::Error>(),
                 Some(rusticnotion::Error::RateLimited {
@@ -224,6 +228,17 @@ async fn permissions_rate_limits_and_unreadable_write_responses_are_actionable()
                 })
             )),
             _ => assert!(format!("{error:#}").contains("Unavailable")),
+        }
+        match status {
+            403 => assert_eq!(CommentReadError::from(error), CommentReadError::Denied),
+            429 => assert_eq!(
+                CommentReadError::from(error),
+                CommentReadError::RateLimited(Duration::from_secs(7))
+            ),
+            _ => assert!(matches!(
+                CommentReadError::from(error),
+                CommentReadError::Other(_)
+            )),
         }
     }
     let server = MockServer::start().await;

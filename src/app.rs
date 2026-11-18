@@ -12,7 +12,7 @@ pub use relocation::PendingRelocation;
 use crate::{
     editor::{Buffer, Editor, Target},
     model::{BlockItem, BlockLabel, InsertPosition, Kind, PageItem, block_labels},
-    service::{Service, Write},
+    service::{CommentReadError, Service, Write},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,17 +38,21 @@ pub struct Location {
 }
 
 pub enum Message {
+    CommentAccess {
+        request: u64,
+        result: Result<bool, CommentReadError>,
+    },
     CommentPresence {
         id: String,
         request: u64,
         generation: u64,
-        retry_after: Option<std::time::Duration>,
-        result: Result<bool, String>,
+        result: Result<bool, CommentReadError>,
     },
     CommentsLoaded {
         id: String,
         generation: u64,
-        result: Result<Vec<crate::comments::Comment>, String>,
+        access_request: u64,
+        result: Result<Vec<crate::comments::Comment>, CommentReadError>,
     },
     CommentSaved {
         id: String,
@@ -160,7 +164,7 @@ impl App {
     pub fn new(service: Service, sender: mpsc::UnboundedSender<Message>, demo: bool) -> Self {
         Self {
             comments: None,
-            comment_indicators: CommentIndicators::default(),
+            comment_indicators: CommentIndicators::new(demo),
             comment_generation: 0,
             service,
             sender,
@@ -311,18 +315,21 @@ impl App {
 
     pub fn receive(&mut self, message: Message) {
         match message {
+            Message::CommentAccess { request, result } => {
+                self.receive_comment_access(request, result);
+            }
             Message::CommentPresence {
                 id,
                 request,
                 generation,
-                retry_after,
                 result,
-            } => self.receive_comment_presence(id, request, generation, result, retry_after),
+            } => self.receive_comment_presence(id, request, generation, result),
             Message::CommentsLoaded {
                 id,
                 generation,
+                access_request,
                 result,
-            } => self.receive_comments(id, generation, result),
+            } => self.receive_comments(id, generation, access_request, result),
             Message::CommentSaved {
                 id,
                 generation,
@@ -365,6 +372,7 @@ impl App {
                             self.page_selected.min(self.pages.len().saturating_sub(1));
                         self.status = format!("{} pages · Enter to open", self.pages.len());
                         self.error = false;
+                        self.probe_comment_access();
                     }
                     Err(error) => self.fail(error),
                 }
@@ -647,6 +655,7 @@ impl App {
             }
             KeyCode::Char('/') => self.search = Some(Buffer::new(self.query.clone())),
             KeyCode::Char('r') => {
+                self.retry_temporary_comment_access();
                 if self.focus == Focus::Pages {
                     self.start_search();
                 } else {

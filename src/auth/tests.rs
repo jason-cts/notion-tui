@@ -523,7 +523,7 @@ async fn a_rejected_read_is_not_retried_indefinitely() {
 }
 
 #[tokio::test]
-async fn comment_reads_renew_oauth_and_share_the_rotated_client() {
+async fn startup_comment_probe_renews_oauth_and_shares_the_rotated_client() {
     let server = MockServer::start().await;
     let (_directory, store) = saved_store().await;
     Mock::given(method("GET"))
@@ -543,10 +543,27 @@ async fn comment_reads_renew_oauth_and_share_the_rotated_client() {
         .mount(&server)
         .await;
     refresh_mock(&server).await;
-    let api = OAuthService::new(session(client(&server), store))
-        .await
-        .unwrap();
-    assert!(!api.has_comments("block").await.unwrap());
+    let api = Arc::new(
+        OAuthService::new(session(client(&server), store))
+            .await
+            .unwrap(),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = crate::app::App::new(api.clone(), tx, false);
+    app.receive(crate::app::Message::Search {
+        generation: 0,
+        result: Ok(vec![crate::model::PageItem {
+            id: "shared-page".into(),
+            title: "Page".into(),
+        }]),
+    });
+    app.receive(
+        tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert!(!app.error);
     assert!(api.comments("block").await.unwrap().is_empty());
 }
 
