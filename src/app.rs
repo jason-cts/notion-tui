@@ -11,9 +11,13 @@ pub use relocation::PendingRelocation;
 
 use crate::{
     editor::{Buffer, Editor, Target},
-    model::{BlockItem, BlockLabel, InsertPosition, Kind, PageItem, block_labels},
-    service::{CommentReadError, Service, Write},
+    image_preview::{PreviewImage, Viewport},
+    model::{BlockItem, BlockLabel, InsertPosition, Kind, PageItem, TableInfo, block_labels},
+    service::{ColumnChange, CommentReadError, Service, Write},
 };
+
+mod table;
+pub use table::{TableMenu, TableMenuKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -25,6 +29,7 @@ pub enum Focus {
 pub enum LocationKind {
     Page,
     Blocks,
+    Table(TableInfo),
     Database,
 }
 
@@ -76,6 +81,10 @@ pub enum Message {
         count: usize,
     },
     Browser(Result<(), String>),
+    ImageLoaded {
+        request: u64,
+        result: Result<PreviewImage, String>,
+    },
     Search {
         generation: u64,
         result: Result<Vec<PageItem>, String>,
@@ -90,6 +99,12 @@ pub enum Message {
         pending: Box<PendingRelocation>,
         result: Result<String, String>,
     },
+    TableReplaced {
+        original: String,
+        change: ColumnChange,
+        copied: bool,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,6 +114,14 @@ pub enum Confirm {
     Quit,
     Delete,
     Relocate,
+    ChangeColumn,
+}
+
+pub struct ImagePreview {
+    pub url: String,
+    pub request: u64,
+    pub result: Option<Result<PreviewImage, String>>,
+    pub viewport: Viewport,
 }
 
 pub struct PendingDelete {
@@ -128,6 +151,12 @@ pub struct App {
     pub blocks: Vec<BlockItem>,
     pub page_selected: usize,
     pub block_selected: usize,
+    pub table_column: usize,
+    pub table_menu: Option<TableMenu>,
+    pub pending_column: Option<ColumnChange>,
+    uncertain_tables: HashSet<String>,
+    pub image_preview: Option<ImagePreview>,
+    image_request: u64,
     pub focus: Focus,
     pub path: Vec<Location>,
     pub query: String,
@@ -176,6 +205,12 @@ impl App {
             blocks: vec![],
             page_selected: 0,
             block_selected: 0,
+            table_column: 0,
+            table_menu: None,
+            pending_column: None,
+            uncertain_tables: HashSet::new(),
+            image_preview: None,
+            image_request: 0,
             focus: Focus::Pages,
             path: vec![],
             query: String::new(),
@@ -363,6 +398,21 @@ impl App {
                 self.error = false;
             }
             Message::Browser(Err(error)) => self.fail(error),
+            Message::ImageLoaded { request, result } => {
+                if let Some(preview) = &mut self.image_preview
+                    && preview.request == request
+                {
+                    preview.result = Some(result);
+                }
+            }
+            Message::TableReplaced {
+                original,
+                change,
+                copied,
+                result,
+            } => {
+                self.finish_table_replacement(original, change, copied, result);
+            }
             Message::Search { generation, result } if generation == self.search_generation => {
                 self.loading_search = false;
                 match result {
@@ -416,16 +466,29 @@ impl App {
                         {
                             self.block_selected = index.min(blocks.len().saturating_sub(1));
                         }
+                        let in_table = matches!(location.kind, LocationKind::Table(_));
                         if let Some(last) = self.path.last_mut() {
                             *last = location;
                         }
                         self.blocks = blocks;
+                        if in_table {
+                            self.table_column = self
+                                .table_column
+                                .min(self.table_columns().saturating_sub(1));
+                        }
                         self.ensure_database_metadata(false);
                         self.error = false;
-                        self.status = format!(
-                            "{} blocks · e edit · d delete · a append · n child page",
-                            self.blocks.len()
-                        );
+                        self.status = if in_table {
+                            format!(
+                                "{} rows · arrows select cells · e edit · a insert · d delete",
+                                self.blocks.len()
+                            )
+                        } else {
+                            format!(
+                                "{} blocks · e edit · d delete · a append · n child page",
+                                self.blocks.len()
+                            )
+                        };
                     }
                     Err(error) => self.fail(error),
                 }
@@ -473,12 +536,21 @@ impl App {
                             }
                         });
                         self.selection_after_insert = self.editor.as_ref().and_then(|editor| {
-                            if let Target::Append { parent, position } = &editor.target {
+                            if let Target::Append { parent, position }
+                            | Target::AppendTableRow {
+                                parent, position, ..
+                            } = &editor.target
+                            {
                                 Some((parent.clone(), position.clone()))
                             } else {
                                 None
                             }
                         });
+                        if self.editor.as_ref().is_some_and(|editor| {
+                            matches!(editor.target, Target::AppendTableRow { .. })
+                        }) {
+                            self.table_column = 0;
+                        }
                         self.editor = None;
                         self.confirm = None;
                         self.error = false;
@@ -542,6 +614,7 @@ impl App {
                         Confirm::Delete => self.delete_block(),
                         Confirm::Relocate => self.relocate_block(),
                         Confirm::DeleteComment => self.delete_comment(),
+                        Confirm::ChangeColumn => self.change_column(),
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -551,6 +624,9 @@ impl App {
                     }
                     if confirm == Confirm::Relocate {
                         self.pending_relocation = None;
+                    }
+                    if confirm == Confirm::ChangeColumn {
+                        self.pending_column = None;
                     }
                 }
                 _ => {}
@@ -563,6 +639,21 @@ impl App {
             } else {
                 self.quit = true;
             }
+            return;
+        }
+        if let Some(preview) = &mut self.image_preview {
+            match key.code {
+                KeyCode::Esc => self.image_preview = None,
+                KeyCode::Char('o') => self.pending_link = Some(preview.url.clone()),
+                _ => {
+                    if let Some(Ok(image)) = &preview.result {
+                        preview.viewport.key(key.code, image);
+                    }
+                }
+            }
+            return;
+        }
+        if self.table_menu_key(key) {
             return;
         }
         if let Some(picker) = &mut self.link_picker {
@@ -631,7 +722,7 @@ impl App {
         if self.comments_key(key) {
             return;
         }
-        if self.database_key(key) {
+        if self.database_key(key) || self.simple_table_key(key) {
             return;
         }
         match key.code {
@@ -660,6 +751,12 @@ impl App {
                     self.start_search();
                 } else {
                     self.invalidate_comment_indicators();
+                    if self.table_info().is_some()
+                        && let Some(block) = self.blocks.get(self.block_selected)
+                        && let Some(location) = self.location()
+                    {
+                        self.selection_after_update = Some((location.id.clone(), block.id.clone()));
+                    }
                     self.load();
                 }
             }
@@ -693,19 +790,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') if self.focus == Focus::Content => {
-                if !self.loading_content
-                    && let Some(location) = self.location()
-                    && location.kind != LocationKind::Database
-                    && let Some(block) = self.blocks.get(self.block_selected)
-                    && !block.id.is_empty()
-                {
-                    self.pending_delete = Some(PendingDelete {
-                        block: block.clone(),
-                        parent: location.id.clone(),
-                        index: self.block_selected,
-                    });
-                    self.confirm = Some(Confirm::Delete);
-                }
+                self.prepare_delete();
             }
             KeyCode::Char('>' | '<') if self.focus == Focus::Content => {
                 self.prepare_relocation(key.code == KeyCode::Char('>'));
@@ -719,42 +804,18 @@ impl App {
                     {
                         self.fail("This block type is read-only");
                     } else {
-                        self.editor = Some(Editor::new(Target::Edit(block)));
+                        let mut editor = Editor::new(Target::Edit(block));
+                        if self.table_info().is_some()
+                            && let Some(row) = &mut editor.row
+                        {
+                            row.active = self.table_column.min(row.cells.len() - 1);
+                        }
+                        self.editor = Some(editor);
                     }
                 }
             }
             KeyCode::Char('a' | 'A') if self.focus == Focus::Content => {
-                if self.loading_content {
-                    return;
-                }
-                if let Some(location) = self.location() {
-                    let selected = self.blocks.get(self.block_selected);
-                    if !self.blocks.is_empty() && selected.is_none_or(|block| block.id.is_empty()) {
-                        self.fail("Select a block before inserting");
-                        return;
-                    }
-                    let position = if self.blocks.is_empty() {
-                        InsertPosition::End
-                    } else if key.code == KeyCode::Char('A') {
-                        match self.block_selected.checked_sub(1) {
-                            None => InsertPosition::Start,
-                            Some(index) => {
-                                let previous = &self.blocks[index];
-                                if previous.id.is_empty() {
-                                    self.fail("Select a block before inserting");
-                                    return;
-                                }
-                                InsertPosition::After(previous.id.clone())
-                            }
-                        }
-                    } else {
-                        InsertPosition::After(selected.unwrap().id.clone())
-                    };
-                    self.editor = Some(Editor::new(Target::Append {
-                        parent: location.id.clone(),
-                        position,
-                    }));
-                }
+                self.start_insert(key.code == KeyCode::Char('A'));
             }
             KeyCode::Char('n') if self.focus == Focus::Content => {
                 if let Some(location) = self.location() {
@@ -817,9 +878,17 @@ impl App {
         } else if !self.loading_content
             && let Some(block) = self.blocks.get(self.block_selected).cloned()
         {
+            if block.block_type == "image" {
+                if let Some(url) = block.image_url {
+                    self.open_image(url);
+                } else {
+                    self.fail("Image URL is unavailable");
+                }
+                return;
+            }
             if block.block_type != "child_database"
                 && !block.child_page
-                && (!block.children || block.id.is_empty())
+                && (block.id.is_empty() || (!block.children && block.block_type != "table"))
             {
                 return;
             }
@@ -854,23 +923,50 @@ impl App {
                     list_depth: 0,
                 });
                 self.load();
-            } else if block.children && !block.id.is_empty() {
+            } else {
                 let page_id = self.location().unwrap().page_id.clone();
                 let list_depth = self.location().unwrap().list_depth
                     + usize::from(matches!(
                         block.kind,
                         Some(Kind::Number | Kind::Bullet | Kind::Todo)
                     ));
+                if block.table.is_some() {
+                    self.table_column = 0;
+                }
                 self.path.push(Location {
                     id: block.id,
-                    title: block.text,
-                    kind: LocationKind::Blocks,
+                    title: if block.table.is_some() {
+                        "Table".into()
+                    } else {
+                        block.text
+                    },
+                    kind: block
+                        .table
+                        .map_or(LocationKind::Blocks, LocationKind::Table),
                     page_id,
                     list_depth,
                 });
                 self.load();
             }
         }
+    }
+
+    fn open_image(&mut self, url: String) {
+        self.image_request += 1;
+        let request = self.image_request;
+        self.image_preview = Some(ImagePreview {
+            url: url.clone(),
+            request,
+            result: None,
+            viewport: Viewport::default(),
+        });
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = crate::image_preview::load(&url)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = sender.send(Message::ImageLoaded { request, result });
+        });
     }
 
     fn save_editor(&mut self) {

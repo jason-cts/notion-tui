@@ -273,6 +273,218 @@ async fn deletion_failures_are_reported_without_replaying_the_request() {
 }
 
 #[tokio::test]
+async fn inserting_a_simple_table_row_sends_one_cell_per_column_and_selects_it() {
+    use crate::app::{App, Focus, Location, LocationKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for (below, empty, position, inserted_index) in [
+        (
+            true,
+            false,
+            json!({"type":"after_block","after_block":{"id":"block"}}),
+            1,
+        ),
+        (false, false, json!({"type":"start"}), 0),
+        (false, true, Value::Null, 0),
+    ] {
+        let server = MockServer::start().await;
+        let mut initial = if empty { vec![] } else { vec![table_row()] };
+        Mock::given(method("GET"))
+            .and(path("/blocks/table/children"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list(json!(initial), None)))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cells = json!([
+            [{"type":"text","text":{"content":"first line\nsecond line"}}],
+            [],
+            [{"type":"text","text":{"content":"你好"}}]
+        ]);
+        let mut expected = json!({"children":[{
+            "object":"block","type":"table_row","table_row":{"cells":cells}
+        }]});
+        if !position.is_null() {
+            expected["position"] = position;
+        }
+        let mut inserted = table_row();
+        inserted["id"] = json!("inserted");
+        inserted["table_row"]["cells"] = cells;
+        for index in [0, 2] {
+            let run = &mut inserted["table_row"]["cells"][index][0];
+            run["plain_text"] = run["text"]["content"].clone();
+        }
+        Mock::given(method("PATCH"))
+            .and(path("/blocks/table/children"))
+            .and(body_json(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list(json!([inserted]), None)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        initial.insert(inserted_index, inserted);
+        Mock::given(method("GET"))
+            .and(path("/blocks/table/children"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list(json!(initial), None)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = Arc::new(ApiService::with_base_url("test".into(), &server.uri()).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(api, tx, false);
+        app.path.push(Location {
+            id: "page".into(),
+            title: "Page".into(),
+            kind: LocationKind::Page,
+            page_id: "page".into(),
+            list_depth: 0,
+        });
+        app.focus = Focus::Content;
+        app.blocks = vec![BlockItem::from_value(&json!({
+            "id":"table","type":"table","has_children":!empty,"table":{"table_width":3}
+        }))];
+        app.key(KeyCode::Enter.into());
+        let first_load = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.receive(first_load);
+        app.key(KeyCode::Char('a').into());
+        if below {
+            app.key(KeyCode::Down.into());
+        }
+        app.key(KeyCode::Enter.into());
+        assert_eq!(
+            app.editor
+                .as_ref()
+                .unwrap()
+                .row
+                .as_ref()
+                .unwrap()
+                .cells
+                .len(),
+            3
+        );
+        app.paste("first line\nsecond line");
+        app.key(KeyCode::BackTab.into());
+        app.paste("你好");
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        for _ in 0..2 {
+            let message = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.receive(message);
+        }
+        assert!(app.editor.is_none());
+        assert_eq!(app.block_selected, inserted_index);
+        assert_eq!(app.blocks[app.block_selected].id, "inserted");
+    }
+}
+
+#[tokio::test]
+async fn column_replacement_preserves_input_and_only_trashes_verified_originals() {
+    for (change, new_width, verified) in [
+        (ColumnChange::Insert(1), 4, true),
+        (ColumnChange::Delete(1), 2, true),
+        (ColumnChange::Insert(1), 4, false),
+    ] {
+        let server = MockServer::start().await;
+        let make_table = |id: &str, width: usize| {
+            let mut table = block("2026-01-01T00:00:00Z");
+            table.as_object_mut().unwrap().remove("paragraph");
+            table["id"] = json!(id);
+            table["parent"] = json!({"type":"page_id","page_id":"page"});
+            table["type"] = json!("table");
+            table["table"] =
+                json!({"table_width":width,"has_row_header":true,"has_column_header":false});
+            table
+        };
+        let table = make_table("original", 3);
+        let old_row = table_row();
+        let mut new_row = table_row();
+        new_row["id"] = json!("new-row");
+        let new_cells = new_row["table_row"]["cells"].as_array_mut().unwrap();
+        match change {
+            ColumnChange::Insert(index) => new_cells.insert(index, json!([])),
+            ColumnChange::Delete(index) => {
+                new_cells.remove(index);
+            }
+        }
+        let expected: Vec<_> = BlockItem::from_value(&new_row)
+            .table_cells
+            .unwrap()
+            .into_iter()
+            .map(|cell| RichText(cell.input.unwrap()).normalized())
+            .collect();
+        if !verified {
+            new_row["table_row"]["cells"][0] = json!([]);
+        }
+        for (id, row) in [("original", old_row.clone()), ("replacement", new_row)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/blocks/{id}/children")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(list(json!([row]), None)))
+                .expect(if id == "original" && verified { 2 } else { 1 })
+                .mount(&server)
+                .await;
+        }
+        for (id, response) in [
+            ("original", table.clone()),
+            ("replacement", make_table("replacement", new_width)),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/blocks/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(if id == "original" && verified { 2 } else { 1 })
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("PATCH")).and(path("/blocks/page/children")).and(body_json(json!({
+            "position":{"type":"after_block","after_block":{"id":"original"}},
+            "children":[{"object":"block","type":"table","table":{
+                "table_width":new_width,"has_column_header":false,"has_row_header":true,
+                "children":[{"object":"block","type":"table_row","table_row":{"cells":expected}}]
+            }}]
+        }))).respond_with(ResponseTemplate::new(200).set_body_json(list(json!([{"id":"replacement"}]), None)))
+            .expect(1).mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/blocks/original"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(usize::from(verified) as u64)
+            .mount(&server)
+            .await;
+        let api = ApiService::with_base_url("test".into(), &server.uri()).unwrap();
+        let mut request = ColumnReplacement {
+            original: "original".into(),
+            parent: "page".into(),
+            table: BlockItem::from_value(&table).table.unwrap(),
+            rows: vec![BlockItem::from_value(&old_row)],
+            change,
+            copy_may_exist: false,
+        };
+        let result = api.replace_table_column(&mut request).await;
+        assert!(request.copy_may_exist);
+        if verified {
+            assert_eq!(result.unwrap(), "replacement");
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .method
+                    .to_string(),
+                "DELETE"
+            );
+        } else {
+            assert!(format!("{:#}", result.unwrap_err()).contains("Replacement did not preserve"));
+            assert!(api.replace_table_column(&mut request).await.is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn table_row_reads_and_updates_all_cells_preserving_unchanged_rich_text() {
     let server = MockServer::start().await;
     let value = table_row();

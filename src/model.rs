@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use crate::rich_text::{RichRun, external_url};
 use rusticnotion::models::{
     requests::{RichTextContent, RichTextInput, TextInput},
@@ -99,6 +101,7 @@ impl From<&str> for RichText {
 #[derive(Clone, Debug)]
 pub struct TableCell {
     pub text: String,
+    pub runs: Vec<RichRun>,
     // None means a mention, equation, or unrecognized run cannot safely round-trip.
     pub input: Option<Vec<RichTextInput>>,
 }
@@ -127,14 +130,14 @@ impl TableCell {
                 })
                 .collect()
         });
+        let runs: Vec<_> = runs
+            .into_iter()
+            .flatten()
+            .map(RichRun::from_value)
+            .collect();
         Self {
-            text: runs
-                .map(|runs| {
-                    runs.iter()
-                        .map(|run| RichRun::from_value(run).text)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            text: runs.iter().map(|run| run.text.as_str()).collect(),
+            runs,
             input,
         }
     }
@@ -190,11 +193,20 @@ pub struct BlockItem {
     pub rich_text: Vec<RichRun>,
     pub input: Option<RichText>,
     pub table_cells: Option<Vec<TableCell>>,
+    pub table: Option<TableInfo>,
+    pub image_url: Option<String>,
     pub children: bool,
     pub checked: bool,
     pub kind: Option<Kind>,
     pub protected: bool,
     pub child_page: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableInfo {
+    pub width: Option<NonZeroUsize>,
+    pub has_column_header: bool,
+    pub has_row_header: bool,
 }
 
 impl BlockItem {
@@ -254,17 +266,20 @@ impl BlockItem {
                 .unwrap_or("")
                 .to_owned();
         }
-        if block_type == "table_row" {
+        let table_cells = if block_type == "table_row" {
+            body["cells"]
+                .as_array()
+                .map(|cells| cells.iter().map(TableCell::from_value).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        if let Some(cells) = &table_cells {
             rich_text.clear();
-            if let Some(cells) = body["cells"].as_array() {
-                for (index, cell) in cells.iter().enumerate() {
-                    if index > 0 {
-                        rich_text.push(RichRun::plain(" │ "));
-                    }
-                    if let Some(runs) = cell.as_array() {
-                        rich_text.extend(runs.iter().map(RichRun::from_value));
-                    }
+            for (index, cell) in cells.iter().enumerate() {
+                if index > 0 {
+                    rich_text.push(RichRun::plain(" │ "));
                 }
+                rich_text.extend(cell.runs.iter().cloned());
             }
             text = rich_text.iter().map(|run| run.text.as_str()).collect();
         }
@@ -279,13 +294,23 @@ impl BlockItem {
             run.url = body["url"].as_str().and_then(external_url);
             rich_text = vec![run];
         }
-        let table_cells = (block_type == "table_row")
-            .then(|| {
-                body["cells"]
-                    .as_array()
-                    .map(|cells| cells.iter().map(TableCell::from_value).collect::<Vec<_>>())
-            })
-            .flatten();
+        let table = (block_type == "table").then(|| TableInfo {
+            width: body["table_width"]
+                .as_u64()
+                .and_then(|width| usize::try_from(width).ok())
+                .and_then(NonZeroUsize::new),
+            has_column_header: body["has_column_header"].as_bool().unwrap_or(false),
+            has_row_header: body["has_row_header"].as_bool().unwrap_or(false),
+        });
+        let image_url = if block_type == "image" {
+            body["type"]
+                .as_str()
+                .filter(|kind| matches!(*kind, "file" | "external"))
+                .and_then(|kind| body[kind]["url"].as_str())
+                .and_then(external_url)
+        } else {
+            None
+        };
         let protected = runs.is_some_and(|runs| runs.iter().any(|r| r["type"] != "text"))
             || (runs.is_some() && input.is_none())
             || table_cells
@@ -306,6 +331,8 @@ impl BlockItem {
             rich_text,
             input,
             table_cells,
+            table,
+            image_url,
             protected,
         }
     }
@@ -340,7 +367,8 @@ impl BlockItem {
         } else {
             self.text.clone()
         };
-        let expandable = self.children || self.block_type == "child_database";
+        let expandable =
+            self.children || matches!(self.block_type.as_str(), "child_database" | "table");
         BlockLabel {
             prefix: format!("{}{marker}", "  ".repeat(depth)),
             text: format!("{text}{}", if expandable { "  ›" } else { "" }),
@@ -473,6 +501,13 @@ pub fn table_row_payload(block: &BlockItem, texts: &[RichText]) -> Result<Value,
     if cells.len() != texts.len() {
         return Err("Table row cell count changed; cancel and refresh before editing again");
     }
+    Ok(json!({"table_row": table_row_fields(texts)?}))
+}
+
+fn table_row_fields(texts: &[RichText]) -> Result<Value, &'static str> {
+    if texts.is_empty() {
+        return Err("A table row requires at least one cell");
+    }
     if texts
         .iter()
         .map(|text| text.plain().chars().count())
@@ -481,7 +516,7 @@ pub fn table_row_payload(block: &BlockItem, texts: &[RichText]) -> Result<Value,
     {
         return Err("Text is limited to 100,000 characters per block");
     }
-    Ok(json!({"table_row":{"cells":texts}}))
+    Ok(json!({"cells": texts}))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -496,8 +531,23 @@ pub fn append_payload(kind: Kind, text: &RichText, position: &InsertPosition) ->
     if kind == Kind::Todo {
         fields["checked"] = json!(false);
     }
+    append_child_payload(kind.name(), fields, position)
+}
+
+pub fn append_table_row_payload(
+    cells: &[RichText],
+    position: &InsertPosition,
+) -> Result<Value, &'static str> {
+    Ok(append_child_payload(
+        "table_row",
+        table_row_fields(cells)?,
+        position,
+    ))
+}
+
+fn append_child_payload(block_type: &str, fields: Value, position: &InsertPosition) -> Value {
     let mut payload =
-        json!({"children": [{"object": "block", "type": kind.name(), kind.name(): fields}]});
+        json!({"children": [{"object": "block", "type": block_type, block_type: fields}]});
     match position {
         InsertPosition::Start => payload["position"] = json!({"type":"start"}),
         InsertPosition::After(after) => {

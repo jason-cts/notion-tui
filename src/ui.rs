@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, Confirm, Focus},
+    app::{App, Confirm, Focus, TableMenu, TableMenuKind},
     editor::{Buffer, Editor, Target},
     hyperlinks::{self, Links},
     model::{BlockLabel, InsertPosition},
@@ -15,6 +15,8 @@ use ratatui::{
 
 mod comments;
 mod database;
+mod image_modal;
+mod table;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACCENT: Color = Color::Rgb(104, 211, 195);
@@ -31,6 +33,8 @@ pub struct Ui {
     block_offsets: std::collections::HashMap<String, usize>,
     database_offsets: std::collections::HashMap<String, usize>,
     pub links: Links,
+    image_art: Option<image_modal::CachedArt>,
+    image_color: image_modal::ImageColor,
 }
 
 fn clean(text: &str) -> String {
@@ -109,11 +113,22 @@ impl Ui {
         self.links.clear();
         self.visible_blocks.clear();
         let area = frame.area();
+        if app.image_preview.is_none() {
+            self.image_art = None;
+        }
         frame.render_widget(
             Block::default().style(Style::default().bg(BG).fg(INK)),
             area,
         );
         if area.width < 16 || area.height < 7 {
+            if let Some(preview) = &app.image_preview {
+                self.image_modal(frame, preview);
+                return;
+            }
+            if let Some(menu) = &app.table_menu {
+                render_table_menu(frame, menu);
+                return;
+            }
             if let Some(modal) = &app.comments {
                 comments::render_comments(frame, modal, app.saving);
                 if let Some(editor) = &app.editor {
@@ -123,7 +138,10 @@ impl Ui {
                 render_confirmation(frame, app);
                 return;
             }
-            if matches!(app.confirm, Some(Confirm::Delete | Confirm::Relocate)) {
+            if matches!(
+                app.confirm,
+                Some(Confirm::Delete | Confirm::Relocate | Confirm::ChangeColumn)
+            ) {
                 render_confirmation(frame, app);
                 return;
             }
@@ -215,6 +233,7 @@ impl Ui {
             Paragraph::new(
                 if app.database().is_some_and(crate::database::DatabaseState::is_table) { "arrows select cells  e edit  Enter icon opens page  Backspace parent  [ / ] views  < > more columns" }
                 else if app.database().is_some() { "[ / ] views  ←/→ columns  Enter page  Backspace parent  v details  o link  r refresh  q quit" }
+                else if app.table_info().is_some() { "arrows select cells  e edit row  a insert  d delete  Backspace parent  r refresh  ? help" }
                 else { "Tab panes  / search  Enter open  c comments  o link  v read  e edit  d delete  >/< indent/outdent  a after  A before  ? help  q quit" },
             )
             .style(Style::default().fg(ACCENT)),
@@ -231,6 +250,8 @@ impl Ui {
             || app.confirm.is_some()
             || app.link_picker.is_some()
             || app.comments.is_some()
+            || app.table_menu.is_some()
+            || app.image_preview.is_some()
         {
             self.links.clear();
         }
@@ -323,6 +344,20 @@ impl Ui {
             render_style_picker(frame, editor);
         }
         render_confirmation(frame, app);
+        if let Some(menu) = &app.table_menu {
+            render_table_menu(frame, menu);
+        }
+        if let Some(preview) = &app.image_preview {
+            self.image_modal(frame, preview);
+        }
+    }
+
+    fn rich_row(&mut self, frame: &mut Frame, line: &RichLine, area: Rect, style: Style) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        frame.render_widget(Paragraph::new(line.line()).style(style), area);
+        hyperlinks::record(&mut self.links, line, area);
     }
 
     fn pages(&mut self, frame: &mut Frame, app: &App, area: Rect) {
@@ -361,6 +396,10 @@ impl Ui {
     fn content(&mut self, frame: &mut Frame, app: &App, area: Rect) {
         if app.database().is_some() {
             self.database_content(frame, app, area);
+            return;
+        }
+        if app.table_info().is_some() {
+            self.simple_table(frame, app, area);
             return;
         }
         let title = app
@@ -492,6 +531,8 @@ impl Ui {
             "  > / <         Indent / outdent selected leaf block (confirm with y)\n",
             "  Space         Toggle selected to-do\n",
             "  a / Shift+A   Insert a block after / before the selected block\n",
+            "  SIMPLE TABLE  Arrows select cells; a insert menu; d delete menu\n",
+            "  IMAGE BLOCK   Enter previews; +/= zoom in; - out; arrows pan; o link\n",
             "  n             Create a child of the current page\n",
             "  Ctrl-S        Save draft            Esc      Cancel draft\n",
             "  Tab           Choose inserted block type\n",
@@ -534,6 +575,7 @@ fn render_text_editor(frame: &mut Frame, editor: &Editor, saving: bool, active: 
         Target::Comment(crate::comments::CommentTarget::Discussion(_)) => "REPLY TO COMMENT",
         Target::Comment(_) => "NEW COMMENT",
         Target::DatabaseCell(_) => unreachable!("cell editor rendered separately"),
+        Target::AppendTableRow { .. } => unreachable!("row editor rendered separately"),
         Target::Append {
             position: InsertPosition::Start,
             ..
@@ -622,6 +664,10 @@ fn render_confirmation(frame: &mut Frame, app: &App) {
                 render_relocation_confirmation(frame, app);
                 return;
             }
+            Confirm::ChangeColumn => {
+                render_column_confirmation(frame, app);
+                return;
+            }
             Confirm::Discard => "Discard this draft?\n\ny discard · n keep editing",
             Confirm::Quit => "Quit and discard this draft?\n\ny quit · n keep editing",
         };
@@ -634,6 +680,47 @@ fn render_confirmation(frame: &mut Frame, app: &App) {
             area,
         );
     }
+}
+
+fn render_table_menu(frame: &mut Frame, menu: &TableMenu) {
+    let area = popup(frame.area(), 42, menu.options().len() as u16 + 3);
+    frame.render_widget(Clear, area);
+    let title = match menu.kind {
+        TableMenuKind::Insert => "INSERT INTO TABLE",
+        TableMenuKind::Delete => "DELETE FROM TABLE",
+    };
+    let items = menu.options().iter().map(|&option| ListItem::new(option));
+    let mut state = ListState::default().with_selected(Some(menu.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(panel(format!("{title} · Enter · Esc"), true))
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        area,
+        &mut state,
+    );
+}
+
+fn render_column_confirmation(frame: &mut Frame, app: &App) {
+    use crate::service::ColumnChange;
+    let Some(change) = app.pending_column else {
+        return;
+    };
+    let action = match change {
+        ColumnChange::Insert(index) => format!("Insert column {}?", index + 1),
+        ColumnChange::Delete(index) => format!("Delete column {} and its cells?", index + 1),
+    };
+    let area = popup(frame.area(), 66, 12);
+    frame.render_widget(Clear, area);
+    let text = format!(
+        "{action}\n\nThis creates a replacement and moves the original to Notion Trash. The table and rows get new IDs. Links to the old blocks and their comments stay with the original.\n\ny replace · n/Esc cancel"
+    );
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(panel("REPLACE TABLE".into(), true))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_relocation_confirmation(frame: &mut Frame, app: &App) {
@@ -713,7 +800,15 @@ fn render_delete_confirmation(frame: &mut Frame, app: &App) {
         block.children || block.child_page || block.block_type == "child_database";
     let area = popup(frame.area(), 68, 12);
     frame.render_widget(Clear, area);
-    let border = panel("DELETE BLOCK".into(), true);
+    let border = panel(
+        if block.block_type == "table_row" {
+            "DELETE ROW"
+        } else {
+            "DELETE BLOCK"
+        }
+        .into(),
+        true,
+    );
     let inner = border.inner(area);
     frame.render_widget(border, area);
     let controls = wrapped(
@@ -771,12 +866,13 @@ fn render_row_editor(frame: &mut Frame, editor: &Editor, saving: bool, cursor: b
     };
     frame.render_widget(Clear, area);
     let inner = if area.height >= 6 && area.width >= 8 {
+        let title = if matches!(&editor.target, Target::AppendTableRow { .. }) {
+            "INSERT TABLE ROW"
+        } else {
+            "EDIT TABLE ROW"
+        };
         let block = panel(
-            format!(
-                "EDIT TABLE ROW · Cell {}/{}",
-                row.active + 1,
-                row.cells.len()
-            ),
+            format!("{title} · Cell {}/{}", row.active + 1, row.cells.len()),
             true,
         );
         let inner = block.inner(area);
@@ -964,6 +1060,176 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn simple_table_shows_selected_cell_without_a_page_column() {
+        use crate::{
+            app::{Location, LocationKind},
+            model::{BlockItem, TableInfo},
+        };
+        use serde_json::json;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(Arc::new(DemoService), tx, true);
+        app.focus = Focus::Content;
+        app.path.push(Location {
+            id: "table".into(),
+            title: "Table".into(),
+            page_id: "page".into(),
+            list_depth: 0,
+            kind: LocationKind::Table(TableInfo {
+                width: std::num::NonZeroUsize::new(6),
+                has_column_header: true,
+                has_row_header: false,
+            }),
+        });
+        let row = |id: &str, values: [&str; 6]| {
+            let cells: Vec<_> = values
+                .into_iter()
+                .map(|text| {
+                    if text.is_empty() {
+                        json!([])
+                    } else {
+                        json!([{"type":"text","text":{"content":text}}])
+                    }
+                })
+                .collect();
+            BlockItem::from_value(&json!({"id":id,"type":"table_row","table_row":{"cells":cells}}))
+        };
+        app.blocks = vec![
+            row("header", ["First", "", "", "", "", "Last"]),
+            row("body", ["", "", "", "", "", "selected\nwrapped"]),
+        ];
+        let mut ui = Ui::default();
+        let mut terminal = Terminal::new(TestBackend::new(42, 14)).unwrap();
+        terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(2, 3)].symbol(), "F");
+        assert!(
+            terminal.backend().buffer()[(2, 3)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        app.block_selected = 1;
+        app.table_column = 5;
+        terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 3)].symbol(), "<");
+        assert_eq!(ui.visible_blocks, ["header", "body"]);
+        assert_eq!(
+            buffer
+                .content
+                .iter()
+                .filter(|cell| cell.bg == table::SELECTED_CELL)
+                .count(),
+            16
+        );
+        assert!(!buffer.content.iter().any(|cell| cell.symbol() == "📄"));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.bg == table::SELECTED_CELL && cell.symbol() == "w")
+        );
+    }
+
+    #[tokio::test]
+    async fn image_preview_pins_source_and_scale_while_zooming_in_color() {
+        use crossterm::event::KeyCode;
+        use image::{DynamicImage, ImageOutputFormat, Rgb, RgbImage};
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(1040, 800, Rgb([255; 3])))
+            .write_to(&mut bytes, ImageOutputFormat::Png)
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/art.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.into_inner()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = format!("{}/art.png", server.uri());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(Arc::new(DemoService), tx, true);
+        app.focus = Focus::Content;
+        app.blocks = vec![crate::model::BlockItem::from_value(
+            &json!({"type":"image","image":{"type":"external","external":{"url":url}}}),
+        )];
+        app.key(KeyCode::Enter.into());
+        assert!(app.image_preview.as_ref().unwrap().result.is_none());
+        app.receive(
+            tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(matches!(
+            app.image_preview.as_ref().unwrap().result,
+            Some(Ok(_))
+        ));
+        let mut ui = Ui {
+            image_color: image_modal::ImageColor::Rgb,
+            ..Ui::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(54, 16)).unwrap();
+        terminal
+            .draw(|frame| {
+                Ui::resize_image_preview(&mut app, frame.area());
+                ui.draw(frame, &app);
+            })
+            .unwrap();
+        let link_row = ui.links.keys().next().unwrap().1;
+        let scale_line = |buffer: &ratatui::buffer::Buffer| {
+            (0..54)
+                .map(|x| buffer[(x, link_row + 1)].symbol())
+                .collect::<String>()
+        };
+        assert!(scale_line(terminal.backend().buffer()).contains("20.00 pixels per character"));
+        let art_row = link_row + 2;
+        assert_eq!(terminal.backend().buffer()[(1, art_row)].symbol(), "@");
+        assert_eq!(
+            terminal.backend().buffer()[(1, art_row)].fg,
+            Color::Rgb(255, 255, 255)
+        );
+
+        app.key(KeyCode::Char('+').into());
+        app.key(KeyCode::Right.into());
+        app.key(KeyCode::Down.into());
+        ui.image_color = image_modal::ImageColor::Indexed;
+        terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+        assert!(scale_line(terminal.backend().buffer()).contains("19.62 pixels per character"));
+        assert_eq!(
+            terminal.backend().buffer()[(1, art_row)].fg,
+            Color::Indexed(231)
+        );
+        assert!(
+            ui.links
+                .iter()
+                .all(|(&(_, y), target)| y == link_row && target == &url)
+        );
+        app.key(KeyCode::Char('-').into());
+        ui = Ui::with_image_color(true);
+        terminal.draw(|frame| ui.draw(frame, &app)).unwrap();
+        assert!(scale_line(terminal.backend().buffer()).contains("20.00 pixels per character"));
+        assert_eq!(terminal.backend().buffer()[(1, art_row)].fg, INK);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0]
+                .headers
+                .keys()
+                .any(|header| header.as_str() == "authorization")
+        );
+        app.key(KeyCode::Char('o').into());
+        assert_eq!(app.pending_link.as_deref(), Some(url.as_str()));
+        app.key(KeyCode::Esc.into());
+        assert!(app.image_preview.is_none());
+    }
 
     #[test]
     fn editing_renders_combined_styles_selection_and_status() {

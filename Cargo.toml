@@ -15,14 +15,17 @@ async-trait = "0.1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
 directories = "6"
+dotenvy = "0.15"
 fs2 = "0.4"
 getrandom = "0.3"
+image = { version = "0.24.9", default-features = false }
 open = "5"
 percent-encoding = "2"
 tempfile = "3"
 thiserror = "1"
 libc = "0.2"
 ratatui = "0.30"
+rascii_art = "0.4.5"
 reqwest = { version = "0.11", features = ["json"] }
 rusticnotion = { git = "https://github.com/jason-cts/rusticnotion.git" }
 serde = { version = "1", features = ["derive"] }

@@ -21,6 +21,53 @@ fn ctrl_s() -> KeyEvent {
     KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
 }
 
+#[test]
+fn simple_table_cell_navigation_and_menu_confirmation() {
+    let (mut app, mut rx) = app();
+    app.path.push(Location {
+        id: "table".into(),
+        title: "Table".into(),
+        page_id: "page".into(),
+        list_depth: 0,
+        kind: LocationKind::Table(TableInfo {
+            width: std::num::NonZeroUsize::new(3),
+            has_column_header: true,
+            has_row_header: false,
+        }),
+    });
+    app.blocks = vec![crate::model::tests::table_row(); 2];
+    app.key(KeyCode::Right.into());
+    app.key(KeyCode::Down.into());
+    app.key(KeyCode::Enter.into());
+    assert_eq!((app.block_selected, app.table_column), (1, 1));
+    assert_eq!(app.location().unwrap().id, "table");
+    app.key(KeyCode::Char('e').into());
+    assert_eq!(app.editor.take().unwrap().row.unwrap().active, 1);
+
+    app.key(KeyCode::Char('A').into());
+    assert!(app.editor.is_none() && app.table_menu.is_none());
+    app.key(KeyCode::Char('d').into());
+    assert!(app.confirm.is_none());
+    app.key(KeyCode::Enter.into());
+    assert!(app.confirm == Some(Confirm::Delete));
+    assert_eq!(app.pending_delete.as_ref().unwrap().index, 1);
+    app.key(KeyCode::Esc.into());
+    app.key(KeyCode::Char('d').into());
+    app.key(KeyCode::Down.into());
+    app.key(KeyCode::Enter.into());
+    assert!(app.confirm == Some(Confirm::ChangeColumn));
+    assert_eq!(app.pending_column, Some(ColumnChange::Delete(1)));
+    app.key(KeyCode::Esc.into());
+    app.key(KeyCode::Char('a').into());
+    for _ in 0..3 {
+        app.key(KeyCode::Down.into());
+    }
+    app.key(KeyCode::Enter.into());
+    assert!(app.confirm == Some(Confirm::ChangeColumn));
+    assert_eq!(app.pending_column, Some(ColumnChange::Insert(2)));
+    assert!(!app.saving && rx.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn formatting_only_save_retains_selection_styles_and_draft_on_failure() {
     let (mut app, mut rx) = app();

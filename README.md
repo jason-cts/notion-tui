@@ -19,6 +19,8 @@ export NOTION_API_TOKEN='your-integration-token'
 cargo run --release
 ```
 
+You can also put `NOTION_API_TOKEN='your-integration-token'` in a `.env` file in the directory where you run the app.
+
 To explore the interface without credentials:
 
 ```sh
@@ -29,11 +31,11 @@ Demo content is read-only. `cargo run -- --help` shows command-line usage. A ter
 
 ## OAuth login
 
-If `NOTION_API_TOKEN` is unset or blank and OAuth client credentials are missing, the app opens a **Connect to Notion** screen. Enter an API token, or press F2 to select OAuth and enter a client ID, client secret, and registered redirect URI. Existing OAuth environment values prefill the form. Tab or the arrow keys move between fields; Enter advances or connects, Ctrl-S connects from any field, and Esc or Ctrl-C cancels. Tokens and client secrets are masked, and bracketed paste is supported.
+The app checks the environment for an API token or a complete OAuth configuration first. It then checks `.env` in the current directory, using its values to fill unset or blank variables. Within each check, an API token takes priority over OAuth.
 
-API tokens entered interactively are used for that run and are not saved. OAuth client credentials also stay in memory; access and refresh tokens from successful OAuth login are saved as described below. You can enter the client credentials again on later runs or set the environment variables to skip setup. `--login` restricts setup to OAuth.
+If these checks find no usable credentials, the app opens the **Connect to Notion** screen. Enter an API token, or press F2 to select OAuth and enter a client ID, client secret, and registered redirect URI. Existing OAuth values prefill the form. Tab or the arrow keys move between fields. Enter advances or connects, Ctrl-S connects from any field, and Esc or Ctrl-C cancels. Tokens and client secrets are masked, and bracketed paste is supported.
 
-When OAuth client credentials are already configured in the environment, the app restores a saved session or opens your browser directly. A nonempty API token takes precedence and does not require OAuth configuration.
+The app uses API tokens and OAuth client credentials entered interactively for that run. Access and refresh tokens from successful OAuth login are saved as described below. When OAuth is already configured, the app restores a saved session or opens your browser. `--login` restricts setup to OAuth.
 
 Create your own OAuth integration in the [Notion developer portal](https://www.notion.so/profile/integrations), enable read/insert/update content capabilities, and register this exact redirect URI in its OAuth configuration:
 
@@ -50,7 +52,7 @@ export NOTION_OAUTH_CLIENT_SECRET='your-client-secret'
 cargo run --release
 ```
 
-The browser prompts you to choose a workspace and share pages. Return to the terminal after allowing access. The terminal also prints the login URL if the browser does not open. Login times out after five minutes; Ctrl-C cancels it. This uses Notion's [authorization-code flow](https://developers.notion.com/guides/authorization/overview). The client secret is supplied locally and is never bundled with the application or saved to disk. Supply the client credentials through the form or environment on subsequent runs so the app can refresh expired credentials. Environment files are not loaded automatically.
+The browser prompts you to choose a workspace and share pages. Return to the terminal after allowing access. The terminal also prints the login URL if the browser does not open. Login times out after five minutes. Ctrl-C cancels it. Supply the client credentials through the form, environment, or `.env` on subsequent runs so the app can refresh expired credentials. [Notion authorization-code flow](https://developers.notion.com/guides/authorization/overview).
 
 To use another callback port, set `NOTION_OAUTH_REDIRECT_URI` to an HTTP loopback URI with an explicit port and register that exact URI with Notion. The listener binds only to a loopback address. If running over SSH, forward the callback port, for example `ssh -L 8765:127.0.0.1:8765 your-host`, and open the printed URL in your local browser. Choose another registered port if 8765 is occupied.
 
@@ -59,7 +61,7 @@ cargo run -- --login    # Force browser login, even when NOTION_API_TOKEN is set
 cargo run -- --logout   # Forget saved local OAuth login and exit
 ```
 
-`--demo`, `--login`, and `--logout` are mutually exclusive. Logout does not revoke the integration in Notion or unset an API token in your shell. Use Notion's connection settings to revoke access. A forced login applies to that run; a set API token takes precedence again on the next normal run.
+`--demo`, `--login`, and `--logout` are mutually exclusive. Logout does not revoke the integration in Notion or unset an API token in your shell. Use Notion's connection settings to revoke access. The usual credential lookup order resumes on the next normal run.
 
 Tokens and workspace metadata are saved as JSON in the platform configuration directory: on Linux, `$XDG_CONFIG_HOME/notion-tui/auth.json`, defaulting to `~/.config/notion-tui/auth.json`; on macOS, `~/Library/Application Support/notion-tui/auth.json`; on Windows, the roaming application-data directory under `notion-tui`. The file contains plaintext tokens. Unix directories and files are created with `0700` and `0600` permissions; symlinks, foreign-owned files, and group/world-accessible permissions are rejected. Fix such permissions before retrying. Credential replacements are atomic and locked between processes. The OAuth client secret is not included in this file.
 
@@ -75,7 +77,7 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | Enter | Open a page or a block's children |
 | Backspace | Return to parent, restoring its selection and scroll position |
 | `[` / `]` | Previous/next saved database view |
-| ←/→ | Move between board columns or database table cells |
+| ←/→ | Move between board columns or table cells |
 | `/` | Search page titles; Enter submits, Esc cancels |
 | `r` | Refresh the focused pane |
 | `v` | Open the full block in a scrollable reader |
@@ -85,8 +87,8 @@ Saved tokens are validated at startup. Expired tokens refresh once, and both rot
 | `d` | Delete the selected block after confirmation |
 | `>` / `<` | Indent / outdent the selected leaf block after confirmation |
 | Space | Toggle a to-do without changing its rich text |
-| `a` | Insert a block immediately after the selected block; create the first block in an empty location |
-| Shift+A | Insert a block immediately before the selected block; create the first block in an empty location |
+| `a` | Insert a block after the selection, or open the simple-table insert menu |
+| Shift+A | Insert a block before the selection outside a simple table |
 | `n` | Create a child of the current page, including when viewing nested blocks |
 | `?` | Keyboard help |
 | `q` / Ctrl-C | Quit |
@@ -95,7 +97,9 @@ The editor supports multiline text, Unicode, bracketed paste, arrows, and Home/E
 
 Shift+Arrow and Shift+Home/End select text in block editors, simple-table cells, and database title/rich-text fields. Formatting applies to selected text; without a selection it changes subsequent typing. Typing, paste, Backspace, and Delete replace or remove the selection. The status line shows `B I U S`: highlighted styles are enabled, dim styles are off, and `~` marks mixed formatting. In the Shift+F10 dialog, use Up/Down to choose, Space to toggle, Enter to apply, and Esc to cancel. Ctrl+I works when the terminal distinguishes it from Tab through enhanced key reporting; otherwise Tab keeps its existing behavior and italic is available through Shift+F10. Existing links, code, and colors are preserved; link/color/code editing is not provided. Search, scalar properties, and the new-child-page title dialog remain plain text.
 
-Insertion stays at the current nesting level: `a` inserts directly after the selected block, and Shift+A inserts directly before it. Both shortcuts create the first block in an empty location. Saving refreshes the list and selects the inserted block. Failed saves retain the draft and its insertion point.
+In a block list, `a` inserts directly after the selected block and Shift+A inserts directly before it. Both shortcuts create the first block in an empty location. Saving refreshes the list and selects the inserted block. Failed saves retain the draft and its insertion point.
+
+Press Enter on an `[image]` block to open its RASCII preview at the full width of the modal. The first line links to the original image, and the second shows the scale in pixels per character. Press `+` or `=` to zoom in by one character, `-` to zoom out, and the arrow keys to pan. The preview uses color when the terminal supports it and honors `NO_COLOR`. Press `o` to open the source in a browser or Esc to close the preview.
 
 Press `>` to make a block the last child of its previous sibling, or `<` to place it immediately after its parent at the grandparent level. Confirm with `y`; `n` or Esc cancels. The app opens the destination and selects the resulting block. The first sibling cannot be indented, and top-level blocks cannot be outdented. This supports leaf paragraphs, bullets, numbered items, and to-dos with editable text. Blocks with children, mentions/equations, headings, tables, pages, and databases cannot be moved. Nesting targets are paragraphs, list items, to-dos, toggles, quotes, and callouts.
 
@@ -147,9 +151,11 @@ Cargo may temporarily resolve that checkout into the lockfile. The declared depe
 
 Editing preserves rich-text styles and links. Ctrl+B, Ctrl+I, and Ctrl+U toggle bold, italic, and underline; Shift+F10 opens the style dialog, which also offers strikethrough. Block colors, child blocks, and a to-do's checked state are preserved when editing text. Mentions, inline equations, and unsupported block types cannot be edited; their blocks can still be deleted with confirmation.
 
-For a simple table, open its children with Enter, select a `table_row`, and press `e`. The row dialog provides one multiline field per cell, including empty cells. Tab and Shift-Tab cycle through cells, Enter inserts a newline, and Ctrl-S saves the whole row. Arrow keys, Home/End, Backspace, and bracketed paste work within the active cell. The dialog scrolls to keep the active cell visible; Esc asks before discarding all cell drafts.
+Open a simple table with Enter and use the arrow keys to select a cell. Press `a` to choose a row above or below, or a column to the left or right. Either row option creates the first row in an empty table. Press `d` to choose a row or column to delete, then confirm. Column changes create a replacement and move the original to Notion Trash after verification. The replacement gets new table and row IDs. Existing links to the old blocks and their comments stay with the original. Tables with mentions, equations, or unsupported cell content cannot be replaced safely.
 
-Each cell preserves its styles, colors, code annotations, and links. Formatting controls apply to the active cell; switching cells retains its cursor, selection, and typing styles. A row containing mentions, equations, or unrecognized rich text cannot be edited. Saving checks the row's timestamp, type, and cell count, preserves empty cells, and restores the selected row after refreshing. Failed saves retain every cell and cursor. Unchanged rows close without a request. Row drafts share the 100,000-character block limit; text runs are split at 2,000 characters. Adding simple-table rows or columns and removing columns are excluded. Database property editing uses the separate cell controls described above. Use `d` to delete a selected row with confirmation.
+Press `e` to open the row editor at the selected cell. The dialog provides one multiline field per column, including empty cells. Tab and Shift-Tab cycle through cells, Enter inserts a newline, and Ctrl-S saves the whole row. Arrow keys, Home/End, Backspace, and bracketed paste work within the active cell. The dialog scrolls to keep the active cell visible. Esc asks before discarding all cell drafts.
+
+Each cell preserves its styles, colors, code annotations, and links. Formatting controls apply to the active cell; switching cells retains its cursor, selection, and typing styles. A row containing mentions, equations, or unrecognized rich text cannot be edited. Updates check the existing row's timestamp, type, and cell count. Saving preserves empty cells and selects the saved row after refreshing. Failed saves retain every cell and cursor. Unchanged edits close without a request. Row drafts share the 100,000-character block limit, and text runs are split at 2,000 characters.
 
 Before updating a block, the app retrieves its current modification timestamp and rejects a conflicting edit. This is a best-effort check: Notion does not provide an atomic compare-and-update operation, so a change between the check and the save can still race. Failed saves retain the draft and show the error. There are no automatic write retries. If a response is lost, inspect Notion before retrying an append or page creation; the first request may have succeeded. Rate-limit errors show the requested waiting time.
 

@@ -18,12 +18,12 @@ pub struct Relocation {
     pub state: RelocationState,
 }
 
-fn same_id(left: &str, right: &str) -> bool {
+pub(super) fn same_id(left: &str, right: &str) -> bool {
     left.replace('-', "")
         .eq_ignore_ascii_case(&right.replace('-', ""))
 }
 
-fn parent_id(value: &Value) -> Option<&str> {
+pub(super) fn parent_id(value: &Value) -> Option<&str> {
     let parent = &value["parent"];
     match parent["type"].as_str()? {
         "page_id" => parent["page_id"].as_str(),
@@ -32,7 +32,7 @@ fn parent_id(value: &Value) -> Option<&str> {
     }
 }
 
-fn trashed(value: &Value) -> bool {
+pub(super) fn trashed(value: &Value) -> bool {
     value["in_trash"] == true || value["archived"] == true
 }
 
@@ -67,7 +67,7 @@ fn leaf_payload(value: &Value) -> Result<Value> {
 }
 
 impl ApiService {
-    async fn relocation_block(&self, id: &str) -> Result<Value> {
+    pub(super) async fn raw_block(&self, id: &str) -> Result<Value> {
         let response = self
             .http
             .get(format!("{}/blocks/{id}", self.base_url))
@@ -80,7 +80,7 @@ impl ApiService {
     }
 
     async fn check_relocation_source(&self, movement: &Relocation) -> Result<Value> {
-        let fresh = self.relocation_block(&movement.original.id).await?;
+        let fresh = self.raw_block(&movement.original.id).await?;
         if fresh["last_edited_time"].as_str() != Some(&movement.original.modified)
             || fresh["type"].as_str() != Some(&movement.original.block_type)
             || parent_id(&fresh).is_none_or(|id| !same_id(id, &movement.source_parent))
@@ -96,7 +96,7 @@ impl ApiService {
     async fn check_relocation_destination(&self, movement: &Relocation) -> Result<()> {
         match &movement.position {
             InsertPosition::End => {
-                let target = self.relocation_block(&movement.destination).await?;
+                let target = self.raw_block(&movement.destination).await?;
                 if trashed(&target)
                     || !BlockItem::from_value(&target).accepts_nested_blocks()
                     || parent_id(&target).is_none_or(|id| !same_id(id, &movement.source_parent))
@@ -118,7 +118,7 @@ impl ApiService {
                 }
             }
             InsertPosition::After(anchor) if same_id(anchor, &movement.source_parent) => {
-                let parent = self.relocation_block(anchor).await?;
+                let parent = self.raw_block(anchor).await?;
                 if trashed(&parent)
                     || !BlockItem::from_value(&parent).accepts_nested_blocks()
                     || parent_id(&parent).is_none_or(|id| !same_id(id, &movement.destination))
@@ -128,7 +128,7 @@ impl ApiService {
                     );
                 }
                 if parent["parent"]["type"] == "block_id" {
-                    let target = self.relocation_block(&movement.destination).await?;
+                    let target = self.raw_block(&movement.destination).await?;
                     if trashed(&target) || !BlockItem::from_value(&target).accepts_nested_blocks() {
                         bail!("The grandparent cannot contain this block");
                     }
@@ -198,13 +198,13 @@ impl ApiService {
         };
         let id = id.clone();
         let result = async {
-            let replacement = self.relocation_block(&id).await?;
+            let replacement = self.raw_block(&id).await?;
             if parent_id(&replacement).is_none_or(|p| !same_id(p, &movement.destination))
                 || leaf_payload(&replacement)? != *payload
             {
                 bail!("Replacement changed; original was not trashed");
             }
-            let original = self.relocation_block(&movement.original.id).await?;
+            let original = self.raw_block(&movement.original.id).await?;
             // A lost delete response is safe to resolve without another append.
             if trashed(&original) {
                 return Ok(id.clone());

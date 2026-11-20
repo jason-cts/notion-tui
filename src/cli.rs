@@ -13,8 +13,9 @@ pub const HELP: &str = "Notion TUI
 
 Usage: notion-tui [--demo | --login | --logout]
 
-A nonempty NOTION_API_TOKEN takes precedence over saved OAuth login.
-Without a token, use saved OAuth credentials or log in through your browser.
+Credentials are checked in the environment first, then in .env in the current directory.
+Within each check, a nonempty NOTION_API_TOKEN takes precedence over OAuth.
+With OAuth configured, use a saved session or log in through your browser.
 Missing credentials open an interactive API token / OAuth setup screen.
 
 OAuth setup:

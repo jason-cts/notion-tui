@@ -14,8 +14,8 @@ use crate::auth::{AuthError, OAuthSession, is_unauthorized};
 use crate::comments::{Comment, CommentWrite};
 use crate::database::{DatabaseData, DatabaseMeta};
 use crate::model::{
-    BlockItem, InsertPosition, Kind, PageItem, RichText, append_payload, table_row_payload,
-    update_payload,
+    BlockItem, InsertPosition, Kind, PageItem, RichText, append_payload, append_table_row_payload,
+    table_row_payload, update_payload,
 };
 use rusticnotion::models::view::View;
 
@@ -24,6 +24,8 @@ pub use comments::CommentReadError;
 pub(crate) mod database;
 mod relocation;
 pub use relocation::{Relocation, RelocationState};
+mod table;
+pub use table::{ColumnChange, ColumnReplacement};
 pub type Progress = Arc<dyn Fn(usize) + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -49,6 +51,11 @@ pub enum Write {
         kind: Kind,
         text: RichText,
     },
+    AppendTableRow {
+        parent: String,
+        position: InsertPosition,
+        cells: Vec<RichText>,
+    },
     Create {
         parent: String,
         title: String,
@@ -72,6 +79,9 @@ pub trait NotionService: Send + Sync {
     async fn write(&self, write: Write) -> Result<Option<PageItem>>;
     async fn relocate(&self, _relocation: &mut Relocation) -> Result<String> {
         bail!("Indent/outdent is unavailable in this service")
+    }
+    async fn replace_table_column(&self, _replacement: &mut ColumnReplacement) -> Result<String> {
+        bail!("Column changes are unavailable in this service")
     }
     async fn database(&self, _id: &str) -> Result<DatabaseMeta> {
         bail!("Database browsing is unavailable")
@@ -251,6 +261,20 @@ impl NotionService for OAuthService {
             result => result,
         }
     }
+    async fn replace_table_column(&self, replacement: &mut ColumnReplacement) -> Result<String> {
+        let (token, api) = self.client().await?;
+        let result = api.replace_table_column(replacement).await;
+        if let Err(error) = &result
+            && is_unauthorized(error)
+        {
+            self.session
+                .refresh(&token)
+                .await
+                .context("Could not renew OAuth login after the table replacement error")?;
+            return result.context("OAuth login refreshed. Check the table before retrying");
+        }
+        result
+    }
     async fn database(&self, id: &str) -> Result<DatabaseMeta> {
         self.read(|api| {
             let id = id.to_owned();
@@ -348,6 +372,9 @@ impl NotionService for ApiService {
     }
     async fn relocate(&self, relocation: &mut Relocation) -> Result<String> {
         self.relocate_block(relocation).await
+    }
+    async fn replace_table_column(&self, replacement: &mut ColumnReplacement) -> Result<String> {
+        self.replace_column(replacement).await
     }
     async fn database(&self, id: &str) -> Result<DatabaseMeta> {
         self.database_metadata(id).await
@@ -510,6 +537,16 @@ impl NotionService for ApiService {
                     append_payload(kind, &text, &position),
                 )
                 .await?;
+            }
+            Write::AppendTableRow {
+                parent,
+                position,
+                cells,
+            } => {
+                let payload =
+                    append_table_row_payload(&cells, &position).map_err(anyhow::Error::msg)?;
+                self.patch(&format!("/blocks/{parent}/children"), payload)
+                    .await?;
             }
             Write::Create { parent, title } => {
                 let request = PageCreateRequest {

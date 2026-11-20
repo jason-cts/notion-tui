@@ -5,6 +5,7 @@ mod comments;
 mod database;
 mod editor;
 mod hyperlinks;
+mod image_preview;
 mod model;
 mod rich_text;
 mod service;
@@ -95,9 +96,9 @@ async fn main() -> Result<()> {
     // Some terminal environments coalesce resize notifications. Poll dimensions
     // on a modest cadence as well; ratatui only writes cells that changed.
     let mut redraw = tokio::time::interval(std::time::Duration::from_millis(250));
-    let mut ui = ui::Ui::default();
     let mut hyperlink_output = hyperlinks::Output::default();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let mut ui = ui::Ui::with_image_color(no_color);
     app.start_search();
     while !app.quit {
         if let Some(url) = app.pending_link.take() {
@@ -118,6 +119,7 @@ async fn main() -> Result<()> {
             });
         }
         let completed = terminal.draw(|frame| {
+            ui::Ui::resize_image_preview(&mut app, frame.area());
             ui.draw(frame, &app);
             if no_color {
                 // Crossterm 0.29 emits empty color parameters under NO_COLOR,

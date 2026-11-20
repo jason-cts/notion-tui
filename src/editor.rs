@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -21,6 +23,11 @@ pub enum Target {
     Append {
         parent: String,
         position: InsertPosition,
+    },
+    AppendTableRow {
+        parent: String,
+        position: InsertPosition,
+        width: NonZeroUsize,
     },
     Create(String),
 }
@@ -211,6 +218,10 @@ impl Editor {
                     .collect(),
                 active: 0,
             }),
+            Target::AppendTableRow { width, .. } => Some(RowDraft {
+                cells: vec![Buffer::from_rich(&[]); width.get()],
+                active: 0,
+            }),
             _ => None,
         };
         let (text, kind) = match &target {
@@ -394,6 +405,20 @@ impl Editor {
                     original: original.clone(),
                     text: Some(self.buffer.rich_text()),
                 },
+            },
+            Target::AppendTableRow {
+                parent, position, ..
+            } => Write::AppendTableRow {
+                parent: parent.clone(),
+                position: position.clone(),
+                cells: self
+                    .row
+                    .as_ref()
+                    .unwrap()
+                    .cells
+                    .iter()
+                    .map(Buffer::rich_text)
+                    .collect(),
             },
             Target::Append { parent, position } => Write::Append {
                 parent: parent.clone(),

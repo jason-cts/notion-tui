@@ -14,7 +14,7 @@ use ratatui::{
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use std::io;
+use std::{collections::HashMap, io, path::Path};
 use unicode_width::UnicodeWidthStr;
 
 // No Debug implementations: these values contain secrets.
@@ -32,9 +32,12 @@ struct Form {
 }
 
 impl Form {
-    fn from_env(force_oauth: bool) -> Result<Self> {
-        let id = env_value("NOTION_OAUTH_CLIENT_ID")?.unwrap_or_default();
-        let secret = env_value("NOTION_OAUTH_CLIENT_SECRET")?.unwrap_or_default();
+    fn from_lookup(
+        force_oauth: bool,
+        lookup: impl Fn(&str) -> Result<Option<String>>,
+    ) -> Result<Self> {
+        let id = lookup("NOTION_OAUTH_CLIENT_ID")?.unwrap_or_default();
+        let secret = lookup("NOTION_OAUTH_CLIENT_SECRET")?.unwrap_or_default();
         let oauth = force_oauth || !id.is_empty() || !secret.is_empty();
         Ok(Self {
             fields: [
@@ -42,8 +45,7 @@ impl Form {
                 Buffer::new(id),
                 Buffer::new(secret),
                 Buffer::new(
-                    env_value("NOTION_OAUTH_REDIRECT_URI")?
-                        .unwrap_or_else(|| DEFAULT_REDIRECT.into()),
+                    lookup("NOTION_OAUTH_REDIRECT_URI")?.unwrap_or_else(|| DEFAULT_REDIRECT.into()),
                 ),
             ],
             oauth,
@@ -235,14 +237,52 @@ impl Form {
     }
 }
 
-pub async fn choose(force_oauth: bool, events: &mut EventStream) -> Result<Option<Choice>> {
-    if !force_oauth && let Some(token) = env_value("NOTION_API_TOKEN")? {
+fn read_dotenv(path: &Path) -> Result<HashMap<String, String>> {
+    let entries = match dotenvy::from_path_iter(path) {
+        Ok(entries) => entries,
+        Err(error) if error.not_found() => return Ok(HashMap::new()),
+        Err(_) => bail!("Could not open .env in the current directory"),
+    };
+    let mut values = HashMap::new();
+    for entry in entries {
+        // Parser errors can contain raw credential values.
+        let (name, value) = entry.map_err(|_| anyhow::anyhow!("Could not read or parse .env"))?;
+        let value = value.trim();
+        if !value.is_empty() {
+            values.entry(name).or_insert_with(|| value.to_owned());
+        }
+    }
+    Ok(values)
+}
+
+fn configured_choice(
+    force_oauth: bool,
+    lookup: impl Fn(&str) -> Result<Option<String>>,
+) -> Result<Option<Choice>> {
+    if !force_oauth && let Some(token) = lookup("NOTION_API_TOKEN")? {
         return Ok(Some(Choice::ApiToken(token)));
     }
-    let mut form = Form::from_env(force_oauth)?;
-    if let Ok(config) = form.oauth_config() {
-        return Ok(Some(Choice::OAuth(config)));
+    Ok(OAuthConfig::from_lookup(lookup).ok().map(Choice::OAuth))
+}
+
+pub async fn choose(force_oauth: bool, events: &mut EventStream) -> Result<Option<Choice>> {
+    if let Some(choice) = configured_choice(force_oauth, env_value)? {
+        return Ok(Some(choice));
     }
+    let mut form = match read_dotenv(Path::new(".env")) {
+        Ok(values) => {
+            let lookup = |name: &str| Ok(env_value(name)?.or_else(|| values.get(name).cloned()));
+            if let Some(choice) = configured_choice(force_oauth, lookup)? {
+                return Ok(Some(choice));
+            }
+            Form::from_lookup(force_oauth, lookup)?
+        }
+        Err(error) => {
+            let mut form = Form::from_lookup(force_oauth, env_value)?;
+            form.error = error.to_string();
+            form
+        }
+    };
     let _guard = TerminalGuard {
         enhanced_keys: false,
     };

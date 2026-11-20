@@ -2,82 +2,22 @@ use super::*;
 use crate::database::{Column, DatabaseData, DatabaseRow, DatabaseState};
 use rusticnotion::chrono::Local;
 
-struct TableLayout {
-    icon_width: u16,
-    columns: Vec<(usize, Rect)>,
-    left: Option<u16>,
-    right: Option<u16>,
-    hidden_left: bool,
-    hidden_right: bool,
-}
+use super::table::{GridLayout, SELECTED_CELL, column_indicators, grid_layout};
 
-/// Geometry is derived from focus so resize and cursor changes always agree.
-fn table_layout(data: &DatabaseData, cell: usize, area: Rect) -> TableLayout {
+fn table_layout(data: &DatabaseData, cell: usize, area: Rect) -> GridLayout {
     let columns = data.columns();
-    let icon_width = area.width.min(3);
-    let remaining = area.width.saturating_sub(icon_width);
-    let mut layout = TableLayout {
-        icon_width,
-        columns: vec![],
-        left: None,
-        right: None,
-        hidden_left: false,
-        hidden_right: false,
-    };
-    if remaining < 3 {
-        return layout;
-    }
-    layout.left = Some(area.x + icon_width);
-    layout.right = Some(area.right() - 1);
-    let width = remaining - 2;
-    let requested_frozen = data
+    let widths = columns
+        .iter()
+        .map(|column| column.width)
+        .collect::<Vec<_>>();
+    let frozen = data
         .view
         .configuration
         .as_ref()
-        .and_then(|c| c.frozen_column_index)
+        .and_then(|config| config.frozen_column_index)
         .unwrap_or(0)
         .min(columns.len().saturating_sub(1));
-    let mut frozen = 0;
-    let mut frozen_width = 0u16;
-    for c in columns.iter().take(requested_frozen) {
-        if frozen_width.saturating_add(c.width + 1).saturating_add(8) > width {
-            break;
-        }
-        frozen += 1;
-        frozen_width += c.width + 1;
-    }
-    let mut start = frozen;
-    if let Some(focus) = cell
-        .checked_sub(1)
-        .filter(|i| *i >= frozen && *i < columns.len())
-    {
-        while start < focus
-            && columns[start..=focus]
-                .iter()
-                .map(|c| u32::from(c.width) + 1)
-                .sum::<u32>()
-                .saturating_sub(1)
-                > u32::from(width - frozen_width)
-        {
-            start += 1;
-        }
-    }
-    layout.hidden_left = start > frozen;
-    let mut x = area.x + icon_width + 1;
-    let right = area.right() - 1;
-    for index in (0..frozen).chain(start..columns.len()) {
-        if x >= right {
-            break;
-        }
-        let w = columns[index].width.min(right - x);
-        layout.columns.push((index, Rect::new(x, area.y, w, 1)));
-        x = x.saturating_add(w + 1);
-    }
-    layout.hidden_right = layout
-        .columns
-        .last()
-        .is_some_and(|(i, r)| *i + 1 < columns.len() || r.width < columns[*i].width);
-    layout
+    grid_layout(&widths, cell.checked_sub(1), 3, frozen, area)
 }
 
 pub(super) fn render_cell_editor(frame: &mut Frame, editor: &Editor, saving: bool, cursor: bool) {
@@ -308,14 +248,6 @@ impl Ui {
         }
     }
 
-    fn rich_row(&mut self, frame: &mut Frame, line: &RichLine, area: Rect, style: Style) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        frame.render_widget(Paragraph::new(line.line()).style(style), area);
-        hyperlinks::record(&mut self.links, line, area);
-    }
-
     fn database_list(
         &mut self,
         frame: &mut Frame,
@@ -517,18 +449,7 @@ impl Ui {
                 *rect,
             );
         }
-        if let Some(x) = layout.left {
-            frame.render_widget(
-                Paragraph::new(if layout.hidden_left { "<" } else { " " }).style(header_style),
-                Rect::new(x, area.y, 1, 1),
-            );
-        }
-        if let Some(x) = layout.right {
-            frame.render_widget(
-                Paragraph::new(if layout.hidden_right { ">" } else { " " }).style(header_style),
-                Rect::new(x, area.y, 1, 1),
-            );
-        }
+        column_indicators(frame, &layout, area.y, header_style);
         let content = Rect::new(
             area.x,
             area.y + 1,
@@ -574,7 +495,7 @@ impl Ui {
         let mut y = content.y;
         let mut last_group = None;
         let normal = Style::default().bg(PANEL).fg(INK);
-        let selected = Style::default().bg(Color::Rgb(43, 53, 66)).fg(INK);
+        let selected = Style::default().bg(SELECTED_CELL).fg(INK);
         for (position, row) in rows.iter().enumerate().skip(offset) {
             if y >= content.bottom() {
                 break;
@@ -613,37 +534,19 @@ impl Ui {
                 } else {
                     normal
                 };
-                frame.render_widget(
-                    Block::default().style(style),
-                    Rect::new(rect.x, y, rect.width, height),
-                );
-                for (line_index, line) in
-                    cell_lines(data, &data.rows[row.row], &columns[*index], rect.width)
-                        .iter()
-                        .take(usize::from(height))
-                        .enumerate()
-                {
-                    self.rich_row(
-                        frame,
-                        line,
-                        Rect::new(rect.x, y + line_index as u16, rect.width, 1),
-                        style,
-                    );
-                }
-                if rect.right() < area.right().saturating_sub(1)
+                let separator = rect.right() < area.right().saturating_sub(1)
                     && data
                         .view
                         .configuration
                         .as_ref()
-                        .is_none_or(|c| c.show_vertical_lines != Some(false))
-                {
-                    for dy in 0..height {
-                        frame.render_widget(
-                            Paragraph::new("│").style(Style::default().fg(MUTED)),
-                            Rect::new(rect.right(), y + dy, 1, 1),
-                        );
-                    }
-                }
+                        .is_none_or(|c| c.show_vertical_lines != Some(false));
+                self.draw_table_cell(
+                    frame,
+                    &cell_lines(data, &data.rows[row.row], &columns[*index], rect.width),
+                    Rect { y, height, ..*rect },
+                    style,
+                    separator,
+                );
             }
             y += height;
         }
